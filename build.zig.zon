@@ -1,0 +1,10 @@
+.{
+    .name = .spider_modules,
+    .version = "0.1.0",
+    .fingerprint = 0x7ef1795ad8e92ef4,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .spider = .{ .path = "../spider" },
+    },
+    .paths = .{""},
+}

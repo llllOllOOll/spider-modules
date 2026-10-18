@@ -1,0 +1,7 @@
+.{
+    .name = .spider_notify,
+    .version = "0.2.0",
+    .paths = .{""},
+    .fingerprint = 0x62305cb8750f7e89,
+    .dependencies = .{},
+}

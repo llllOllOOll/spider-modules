@@ -1,0 +1,45 @@
+# The ecosystem check: every official module built and tested against one
+# Spider ref (scripts/ecosystem.sh). Runs on every change here, nightly
+# against Spider main, and from Spider's release workflow against each
+# release candidate (workflow_call): a Spider release does not ship while an
+# official module fails.
+name: Ecosystem
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '30 3 * * *' # nightly, against Spider main
+  workflow_dispatch:
+    inputs:
+      spider_ref:
+        description: 'Spider ref (branch, tag or commit) to test against'
+        default: main
+  workflow_call:
+    inputs:
+      spider_ref:
+        description: 'Spider ref to test against'
+        type: string
+        default: main
+
+jobs:
+  modules:
+    name: Modules against Spider ${{ inputs.spider_ref || 'main' }}
+    runs-on: ubuntu-latest
+    steps:
+      # build.zig.zon expects Spider at ../spider: both checkouts side by side.
+      - uses: actions/checkout@v4
+        with:
+          repository: llllOllOOll/spider-modules
+          path: spider-modules
+      - uses: actions/checkout@v4
+        with:
+          repository: llllOllOOll/spider
+          ref: ${{ inputs.spider_ref || 'main' }}
+          path: spider
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - name: Every module against this Spider
+        working-directory: spider-modules
+        run: scripts/ecosystem.sh
