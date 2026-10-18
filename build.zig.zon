@@ -4,7 +4,15 @@
     .fingerprint = 0x7ef1795ad8e92ef4,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        .spider = .{ .path = "../spider" },
+        // The Spider these modules were last checked against. Lazy: only
+        // this repository's own build (the tests) fetches it, never an app
+        // that depends on this package. scripts/ecosystem.sh replaces it
+        // with a Spider checkout (`zig build --fork=../spider`).
+        .spider = .{
+            .url = "git+https://github.com/llllOllOOll/spider#2d396f50a58899334d88ab7decd88735c21efadb",
+            .hash = "spider-0.11.0-dev.1-P7cGrsIa0wCWevpU23Cy6wchTVnNUC-RnMF02P40k5nn",
+            .lazy = true,
+        },
     },
     .paths = .{""},
 }

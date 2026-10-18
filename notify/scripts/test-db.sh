@@ -31,4 +31,6 @@ for _ in $(seq 1 60); do
 done
 
 cd "$ROOT"
-NOTIFY_PG_PORT="$PORT" zig build test-notify-db --summary all
+# SPIDER_FORK (set by scripts/ecosystem.sh): a Spider checkout instead of
+# the one pinned in build.zig.zon.
+NOTIFY_PG_PORT="$PORT" zig build test-notify-db ${SPIDER_FORK:-} --summary all

@@ -52,18 +52,20 @@ against a Spider checkout:
 ## Layout and tests
 
 ```
-build.zig            wires every module to ../spider for the tests
+build.zig            wires every module to one Spider for the tests
 <module>/            one package per module: build.zig, build.zig.zon,
                      src/ (src/sql/ for migrations), test/, scripts/test-db.sh
 scripts/ecosystem.sh every module against one Spider
 ```
 
-With Spider checked out next to this repository (`../spider`):
+The tests use the Spider pinned in `build.zig.zon`, or a Spider checkout
+given with `--fork` (a path relative to this repository):
 
 ```sh
-zig build test                 # unit tests of every module
-notify/scripts/test-db.sh      # notify on a disposable Postgres (Docker)
-scripts/ecosystem.sh           # everything, as the release gate runs it
+zig build test                    # unit tests, against the pinned Spider
+zig build test --fork=../spider   # the same, against a checkout
+notify/scripts/test-db.sh         # notify on a disposable Postgres (Docker)
+scripts/ecosystem.sh              # everything against ../spider (SPIDER_DIR), as the release gate runs it
 ```
 
 Writing a module: [CONTRIBUTING.md](CONTRIBUTING.md).

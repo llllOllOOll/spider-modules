@@ -1,6 +1,6 @@
 //! The official Spider modules, built and tested together against one
-//! Spider (the `spider` dependency: `../spider`, a checkout next to this
-//! repository, which is also how CI lays them out).
+//! Spider: the `spider` dependency of build.zig.zon, or a Spider checkout
+//! given with `zig build --fork=<path>` (scripts/ecosystem.sh, CI).
 //!
 //! Each module is its own package (`<module>/build.zig.zon`) with no
 //! dependency on Spider: an app adds it and passes its own `spider` module
@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
     // repository's own build.
     if (!b.isRoot()) return;
 
-    const spider_dep = b.dependency("spider", .{ .target = target, .optimize = optimize, .pg = true });
+    const spider_dep = b.lazyDependency("spider", .{ .target = target, .optimize = optimize, .pg = true }) orelse return;
     const spider_mod = spider_dep.module("spider");
     const db_runner = spider_dep.path("test_runner.zig");
 
