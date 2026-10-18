@@ -15,6 +15,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // An app that depends on this package only takes the modules' source
+    // files (`dependency.path("notify/src/notify.zig")`) and gives them its
+    // own spider. A second Spider here would share its spider_pg with the
+    // app's and point it at the wrong `spider` ("file exists in modules
+    // 'spider' and 'spider0'"): the tests below exist only in this
+    // repository's own build.
+    if (!b.isRoot()) return;
+
     const spider_dep = b.dependency("spider", .{ .target = target, .optimize = optimize, .pg = true });
     const spider_mod = spider_dep.module("spider");
     const db_runner = spider_dep.path("test_runner.zig");

@@ -80,7 +80,7 @@ transaction, and their delivery row is written as `sent` directly.
 ## Tables
 
 `src/sql/0001_init.sql`, the module's first migration: Spider applies it
-(`spider migrate`, `server.migrateModules`) and records it as
+(`spider migrate`, `server.migrate`) and records it as
 `notify/0001_init` with its checksum. A change to the schema is a new
 migration (`0002_...`), never an edit of a released one.
 

@@ -67,8 +67,8 @@ agree).
 ## Tests
 
 - Unit tests next to the code (`zig build test-<name>`).
-- With tables: a module test that goes through Spider (`checkModules` not
-  ready → `migrateModules` → ready), then the database tests on the tables
+- With tables: a module test that goes through Spider (`check` not
+  ready → `migrate` → ready), then the database tests on the tables
   Spider created, on a disposable Postgres (`scripts/test-db.sh`, tmpfs, a
   port of its own). Never against a database you care about.
 - `scripts/ecosystem.sh` must pass before a change is merged.

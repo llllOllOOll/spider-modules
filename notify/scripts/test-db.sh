@@ -2,7 +2,7 @@
 # Runs notify's module and database tests against a DISPOSABLE Postgres:
 # starts an empty one in memory (tmpfs), runs `zig build test-notify-db` from
 # the repository root and removes the container. No SQL is loaded here: the
-# module test has Spider apply notify's migrations (server.migrateModules),
+# module test has Spider apply notify's migrations (server.migrate),
 # which is what the database tests then use.
 #
 #   notify/scripts/test-db.sh

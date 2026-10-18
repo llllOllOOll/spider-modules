@@ -138,6 +138,6 @@ From the root of `spider-modules`, with Spider checked out at `../spider`:
 
 - `zig build test-notify` — unit tests, no database.
 - `notify/scripts/test-db.sh` — on a disposable Postgres (Docker), empty:
-  Spider applies the module's migrations (`server.migrateModules`), the
+  Spider applies the module's migrations (`server.migrate`), the
   server is checked before and after, then the database tests run on those
   tables.

@@ -1,6 +1,6 @@
 //! notify as a Spider module, end to end against a DISPOSABLE Postgres with
 //! no tables at all (scripts/test-db.sh): the server says it is not ready
-//! while `notify/0001_init` is pending, `migrateModules` applies it once,
+//! while `notify/0001_init` is pending, `migrate` applies it once,
 //! the server is then ready, and notify's own check fails when one of its
 //! tables cannot be read. Runs before db_test.zig, which uses the tables
 //! this migration creates.
@@ -52,16 +52,16 @@ test "notify module: not ready until spider migrates it, then ready; migrating a
     defer server.deinit();
     _ = server.mountModules(.{notify});
 
-    const before = server.checkModules(a, threaded.?.io());
+    const before = server.check(a, threaded.?.io());
     try std.testing.expect(!before.ok());
     try std.testing.expect(std.mem.indexOf(u8, try messages(before, a), "migration notify/0001_init is not applied") != null);
 
-    try std.testing.expectEqual(@as(usize, 1), try server.migrateModules(a));
-    const after = server.checkModules(a, threaded.?.io());
+    try std.testing.expectEqual(@as(usize, 1), try server.migrate(a));
+    const after = server.check(a, threaded.?.io());
     if (!after.ok()) std.debug.print("{s}", .{try messages(after, a)});
     try std.testing.expect(after.ok());
 
-    try std.testing.expectEqual(@as(usize, 0), try server.migrateModules(a));
+    try std.testing.expectEqual(@as(usize, 0), try server.migrate(a));
     const recorded = try pg.queryOne(struct { version: []const u8, checksum: []const u8 }, a,
         \\SELECT version, checksum FROM schema_migrations WHERE version = 'notify/0001_init'
     , .{});
@@ -78,12 +78,12 @@ test "notify module: its own check fails when a table cannot be read" {
     var server = spider.app(.{});
     defer server.deinit();
     _ = server.mountModules(.{notify});
-    _ = try server.migrateModules(a);
+    _ = try server.migrate(a);
 
     try pg.query(void, a, "ALTER TABLE notify_inbox RENAME TO notify_inbox_away", .{});
     defer pg.query(void, a, "ALTER TABLE notify_inbox_away RENAME TO notify_inbox", .{}) catch {};
 
-    const report = server.checkModules(a, threaded.?.io());
+    const report = server.check(a, threaded.?.io());
     try std.testing.expect(!report.ok());
     const text = try messages(report, a);
     try std.testing.expect(std.mem.indexOf(u8, text, "notify: cannot read its tables") != null);

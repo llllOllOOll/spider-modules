@@ -1,5 +1,5 @@
 -- spider_notify 0001_init: the module's tables. Applied by `spider migrate`
--- (server.migrateModules) in a transaction Spider opens, recorded as
+-- (server.migrate) in a transaction Spider opens, recorded as
 -- notify/0001_init with its checksum. Never edit it once released: add
 -- 0002_... instead. PostgreSQL 13 or newer (gen_random_uuid).
 
