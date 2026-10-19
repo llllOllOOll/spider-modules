@@ -9,8 +9,8 @@
         // that depends on this package. scripts/ecosystem.sh replaces it
         // with a Spider checkout (`zig build --fork=../spider`).
         .spider = .{
-            .url = "git+https://github.com/llllOllOOll/spider#2d396f50a58899334d88ab7decd88735c21efadb",
-            .hash = "spider-0.11.0-dev.1-P7cGrsIa0wCWevpU23Cy6wchTVnNUC-RnMF02P40k5nn",
+            .url = "git+https://github.com/llllOllOOll/spider?ref=v0.11.0#4deaac0c713a78d801763cc072c9b48182447625",
+            .hash = "spider-0.11.0-P7cGrgVS0wDwj8Kifdr2RaEiXPkVaFbNaDNbzGeKiI3f",
             .lazy = true,
         },
     },
