@@ -10,6 +10,10 @@
 //! PNG (with transparency) and JPEG images, links, document properties,
 //! and compressed output. Coordinates are points from the top-left corner.
 //!
+//! Existing PDFs can be edited (`Editor`): rotate, remove, reorder and
+//! copy pages between files (merge, split), stamp new content over a page,
+//! set the document properties, fill form fields, and save.
+//!
 //! A Spider module (`spider_module` below) with no tables, routes or
 //! settings: import it and use it. `send` answers a request with the
 //! document.
@@ -54,6 +58,15 @@ pub const TableError = @import("table.zig").Error;
 pub const ImageError = @import("image.zig").Error;
 pub const FontError = @import("truetype.zig").Error;
 
+const editor = @import("editor.zig");
+/// Editing existing PDF files: pages, stamps, properties, forms.
+pub const Editor = editor.Editor;
+pub const EditError = editor.Error;
+pub const ReadError = @import("reader.zig").Error;
+pub const Properties = editor.Properties;
+pub const Field = editor.Field;
+pub const FieldKind = editor.FieldKind;
+
 pub const spider_module = spider.module(.{
     .name = "pdf",
     .version = "0.1.0",
@@ -88,6 +101,10 @@ test {
     _ = @import("document.zig");
     _ = @import("table.zig");
     _ = @import("truetype.zig");
+    _ = @import("syntax.zig");
+    _ = @import("filters.zig");
+    _ = @import("reader.zig");
+    _ = @import("editor.zig");
 }
 
 test "the module manifest is pdf 0.1.0" {

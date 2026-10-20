@@ -3,7 +3,8 @@
 # tools that read PDFs the way readers do: qpdf (structure, xref, streams),
 # pdftotext (the text comes back, accents included) and pdffonts (an
 # embedded font is a subset with a Unicode map). Needs qpdf and
-# poppler-utils. The embedded font is PDF_FONT, or Noto Sans when it is
+# poppler-utils. The sample is then loaded and saved by the Editor, and the
+# copy checked the same way. The embedded font is PDF_FONT, or Noto Sans when it is
 # installed; without either, that page is skipped.
 set -euo pipefail
 
@@ -40,4 +41,13 @@ if [ -n "$font" ]; then
     fi
   done
 fi
-echo "ok: $out passes qpdf and its text reads back"
+# The editor: load the sample and save it again; the copy must pass too.
+zig build pdf-roundtrip
+copy=zig-out/pdf-sample-roundtrip.pdf
+zig-out/bin/pdf-roundtrip "$out" "$copy"
+qpdf --check "$copy" >/dev/null
+if [ "$(pdftotext "$copy" - | md5sum)" != "$(pdftotext "$out" - | md5sum)" ]; then
+  echo "error: the text of $copy differs from $out" >&2
+  exit 1
+fi
+echo "ok: $out passes qpdf and its text reads back; so does its copy saved by the Editor"

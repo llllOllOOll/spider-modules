@@ -78,6 +78,17 @@ pub fn build(b: *std.Build) void {
     const sample_pdf = run_sample.addOutputFileArg("pdf-sample.pdf");
     if (b.option([]const u8, "pdf-font", "pdf-sample: a TrueType font to embed on an extra page")) |font| run_sample.addArg(font);
     const install_sample = b.addInstallFile(sample_pdf, "pdf-sample.pdf");
+    const roundtrip = b.addExecutable(.{
+        .name = "pdf-roundtrip",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pdf/examples/roundtrip.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "spider_pdf", .module = pdf_mod }},
+        }),
+    });
+    b.step("pdf-roundtrip", "pdf: build zig-out/bin/pdf-roundtrip (load and save PDFs made by other tools)").dependOn(&b.addInstallArtifact(roundtrip, .{}).step);
+
     b.step("pdf-sample", "pdf: write zig-out/pdf-sample.pdf (-Dpdf-font=x.ttf adds a page in that font)").dependOn(&install_sample.step);
 }
 

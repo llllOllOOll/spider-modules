@@ -25,6 +25,14 @@ LibreOffice) and no dependency beyond `std`.
   **page sizes** (A4, A5, Letter, Legal, custom, landscape, mixed in one
   document) and **compressed** page contents.
 
+- **Editing existing PDFs** (`Editor`): rotate, remove, reorder and copy
+  pages between files (merge, split), stamp new content over a page (a
+  watermark, "PAID", a signature image) with the same drawing API, read and
+  set the document properties, list and fill form fields (text,
+  checkboxes), save. Reads classic and stream cross-references, object
+  streams and incremental updates, and repairs files whose
+  cross-reference data is broken.
+
 Coordinates are points (1/72 inch) from the **top-left** corner.
 
 ## Use
@@ -93,6 +101,40 @@ for (0..doc.pageCount()) |i| {
 
 Outside a request, `doc.toBytes(allocator)` returns the file.
 
+### Editing a PDF that already exists
+
+```zig
+var ed = try pdf.Editor.load(allocator, uploaded_bytes); // bytes outlive the editor
+defer ed.deinit();
+
+try ed.rotatePage(0, 90);
+try ed.removePage(ed.pageCount() - 1);
+try ed.movePage(2, 0);
+
+// Merge: pages of another file (any order, repeats allowed)
+var annex = try pdf.Editor.load(allocator, annex_bytes);
+defer annex.deinit();
+try ed.importPages(&annex, &.{ 0, 1, 2 });
+
+// Stamp: draw on a Document the size of the page, then lay it over the page
+var paid = try pdf.Document.init(allocator, .{ .size = try ed.pageSize(0) });
+defer paid.deinit();
+try paid.text(420, 70, "PAID", .{ .font = .helvetica_bold, .size = 28, .color = pdf.Color.hex("#16a34a") });
+try ed.stamp(0, &paid, 0);
+
+// Properties and forms
+try ed.setProperties(.{ .title = "Contrato 42" });
+for (try ed.fields()) |f| std.debug.print("{s} ({s}) = {?s}\n", .{ f.name, @tagName(f.kind), f.value });
+try ed.setText("customer.name", "Maria José");
+try ed.setCheckbox("agree", true);
+
+const out = try ed.save(allocator); // a complete new file
+defer allocator.free(out);
+```
+
+A split is a new file from some pages: load the source, load (or make) a
+target, `importPages`, and remove the target's own pages.
+
 The module declares a manifest (`pdf` 0.1.0) but has no tables, routes or
 settings: mounting it with `server.mountModules` is optional.
 
@@ -106,7 +148,13 @@ settings: mounting it with `server.mountModules` is optional.
   scripts need a shaper); text runs left to right.
 - PNG with 16 bits per channel and interlaced PNG are refused by name;
   images over 10,000 pixels on a side too.
-- It writes PDFs; it does not read or edit existing ones.
+- Editing: encrypted (password-protected) files are refused with
+  `error.EncryptedPdf`; a save writes a new file, so a digital signature
+  the file had no longer validates; filled text fields are drawn by the
+  reader (`NeedAppearances`, honored by Acrobat, browsers and Preview), not
+  by this module; form fields of imported pages are not merged into the
+  form of the target; stamps go in the page's unrotated space.
+- It does not render PDFs or extract their text.
 
 ## Tests
 
@@ -115,6 +163,7 @@ zig build test-pdf        # unit tests, including a request through Spider
 pdf/scripts/check.sh      # the sample through qpdf, pdftotext and pdffonts (PDF_FONT=x.ttf, or Noto Sans)
 zig build pdf-sample      # writes zig-out/pdf-sample.pdf to open in readers
 zig build pdf-sample -Dpdf-font=x.ttf   # with a page in an embedded font
+zig build pdf-roundtrip   # zig-out/bin/pdf-roundtrip in.pdf out.pdf: load and save a file made elsewhere
 ```
 
 `pdf/examples/sample.zig` uses every feature; open its output in a few
