@@ -21,10 +21,33 @@
 const std = @import("std");
 const fonts = @import("fonts.zig");
 const text_mod = @import("text.zig");
+const truetype = @import("truetype.zig");
 const codec = @import("image.zig");
 const table_mod = @import("table.zig");
 
-pub const Font = fonts.Font;
+/// A font to write with: one of the standard fonts every PDF reader has
+/// (`.helvetica`, `.courier_bold`...), or a TrueType font added with
+/// `Document.addFont`.
+pub const Font = union(enum) {
+    helvetica,
+    helvetica_bold,
+    helvetica_oblique,
+    helvetica_bold_oblique,
+    courier,
+    courier_bold,
+    courier_oblique,
+    courier_bold_oblique,
+    /// A font from `Document.addFont` (its index in the document).
+    embedded: u16,
+
+    /// The standard font, or null for an embedded one.
+    pub fn standard(self: Font) ?fonts.Standard {
+        return switch (self) {
+            .embedded => null,
+            inline else => |_, tag| @field(fonts.Standard, @tagName(tag)),
+        };
+    }
+};
 pub const Column = table_mod.Column;
 pub const TableOptions = table_mod.TableOptions;
 
@@ -151,6 +174,19 @@ const Page = struct {
     links: std.ArrayList(Link) = .empty,
 };
 
+const EmbeddedFont = struct {
+    tt: truetype.TrueType,
+    hash: u64,
+    /// Glyphs drawn so far (one entry per glyph of the font).
+    used: []bool,
+    /// The character each drawn glyph stands for, for copy and paste.
+    unicode: []u21,
+
+    fn isUsed(self: EmbeddedFont) bool {
+        return std.mem.indexOfScalar(bool, self.used, true) != null;
+    }
+};
+
 const StoredImage = struct {
     encoded: codec.Encoded,
     hash: u64,
@@ -163,7 +199,8 @@ pub const Document = struct {
     pages: std.ArrayList(Page) = .empty,
     current: usize = 0,
     images: std.ArrayList(StoredImage) = .empty,
-    fonts_used: std.EnumSet(Font) = .empty,
+    fonts_used: std.EnumSet(fonts.Standard) = .empty,
+    embedded: std.ArrayList(EmbeddedFont) = .empty,
     /// The flowing cursor: where the next `paragraph` or `table` starts,
     /// in points from the top of the current page.
     y: f32 = 0,
@@ -257,60 +294,115 @@ pub const Document = struct {
         if (self.y + h > self.bottom()) try self.addPage();
     }
 
-    // ── Text ────────────────────────────────────────────────────────────
+    // ── Fonts and text ──────────────────────────────────────────────────
+
+    /// Adds a TrueType font (.ttf) and returns it as a `Font` to write
+    /// with: any character the font has, in any script. Only the glyphs the
+    /// document uses are embedded. The same bytes added twice give the same
+    /// font. `bytes` must outlive the document (an `@embedFile`, or memory
+    /// freed after `toBytes`).
+    ///
+    /// Fails with `error.UnsupportedFont` for OpenType fonts with
+    /// PostScript outlines (.otf with CFF) and collections (.ttc),
+    /// `error.FontNotEmbeddable` when the font's license forbids embedding,
+    /// `error.InvalidFont` for anything else that is not a TrueType font.
+    pub fn addFont(self: *Document, bytes: []const u8) !Font {
+        const hash = std.hash.Wyhash.hash(0, bytes);
+        for (self.embedded.items, 0..) |e, i| {
+            if (e.hash == hash and e.tt.data.len == bytes.len) return .{ .embedded = @intCast(i) };
+        }
+        const tt = try truetype.TrueType.parse(bytes);
+        const used = try self.alloc().alloc(bool, tt.num_glyphs);
+        @memset(used, false);
+        const unicode = try self.alloc().alloc(u21, tt.num_glyphs);
+        @memset(unicode, 0);
+        try self.embedded.append(self.alloc(), .{ .tt = tt, .hash = hash, .used = used, .unicode = unicode });
+        return .{ .embedded = @intCast(self.embedded.items.len - 1) };
+    }
 
     /// The width of `str` (UTF-8) in points.
-    pub fn textWidth(str: []const u8, font: Font, size: f32) f32 {
-        return fonts.widthUtf8(str, font, size);
+    pub fn textWidth(self: *Document, str: []const u8, font: Font, size: f32) f32 {
+        var units: u32 = 0;
+        var i: usize = 0;
+        while (i < str.len) {
+            const cp = nextCodepoint(str, &i);
+            units += self.encodeChar(font, cp).width;
+        }
+        return @as(f32, @floatFromInt(units)) / 1000.0 * size;
     }
 
     /// Writes one line of text with its baseline at `y`. `opts.align`
     /// says where `x` is: the left end, the middle or the right end. Line
     /// breaks in `str` become spaces (see `textBox` for several lines).
     pub fn text(self: *Document, x: f32, y: f32, str: []const u8, opts: TextOptions) !void {
-        const encoded = try self.encode(str);
-        for (encoded) |*b| {
-            if (b.* == '\n') b.* = ' ';
-        }
-        try self.writeLine(x, y, encoded, opts);
+        const run = try self.encodeRun(str, opts.font, true);
+        try self.writeLine(x, y, run, .{ .start = 0, .end = run.codes.len }, opts);
     }
 
-    fn writeLine(self: *Document, x: f32, y: f32, encoded: []const u8, opts: TextOptions) !void {
-        const w = fonts.width(encoded, opts.font, opts.size);
+    fn writeLine(self: *Document, x: f32, y: f32, run: text_mod.Run, ln: text_mod.Line, opts: TextOptions) !void {
+        const w = run.width(ln.start, ln.end, opts.size);
         const left = switch (opts.@"align") {
             .left => x,
             .center => x - w / 2,
             .right => x - w,
         };
-        self.fonts_used.insert(opts.font);
+        const a = self.alloc();
         const c = &self.page().content;
-        try c.print(self.alloc(), "BT /F{d} {d:.2} Tf ", .{ @backingInt(opts.font), opts.size });
+        if (opts.font.standard()) |std_font| {
+            self.fonts_used.insert(std_font);
+            try c.print(a, "BT /F{d} {d:.2} Tf ", .{ @backingInt(std_font), opts.size });
+        } else {
+            try c.print(a, "BT /E{d} {d:.2} Tf ", .{ opts.font.embedded, opts.size });
+        }
         try self.color(opts.color, "rg");
-        try c.print(self.alloc(), "{d:.2} {d:.2} Td ", .{ left, self.height() - y });
-        try writeLiteral(self.alloc(), c, encoded);
-        try c.appendSlice(self.alloc(), " Tj ET\n");
+        try c.print(a, "{d:.2} {d:.2} Td ", .{ left, self.height() - y });
+        if (opts.font.standard() != null) {
+            const bytes = try a.alloc(u8, ln.end - ln.start);
+            for (run.codes[ln.start..ln.end], bytes) |code, *b| b.* = @intCast(code);
+            try writeLiteral(a, c, bytes);
+        } else {
+            // Two bytes per glyph number (Identity-H), in hex.
+            const e = &self.embedded.items[opts.font.embedded];
+            try c.append(a, '<');
+            for (run.codes[ln.start..ln.end], run.cps[ln.start..ln.end]) |gid, cp| {
+                e.used[gid] = true;
+                if (e.unicode[gid] == 0) e.unicode[gid] = cp;
+                try c.print(a, "{X:0>4}", .{gid});
+            }
+            try c.append(a, '>');
+        }
+        try c.appendSlice(a, " Tj ET\n");
+    }
+
+    fn ascent(self: *Document, font: Font) f32 {
+        if (font.standard()) |f| return f.ascent();
+        const tt = &self.embedded.items[font.embedded].tt;
+        return @as(f32, @floatFromInt(tt.ascent)) / @as(f32, @floatFromInt(tt.units_per_em));
     }
 
     /// Writes `str` wrapped to `box_width`, its first line's top at `y`
     /// (the box's top, not a baseline). Returns the height the lines take.
     pub fn textBox(self: *Document, x: f32, y: f32, box_width: f32, str: []const u8, opts: TextOptions) !f32 {
-        const lines = try self.wrapLines(str, box_width, opts);
+        const run = try self.encodeRun(str, opts.font, false);
+        const lines = try text_mod.wrap(self.alloc(), run, box_width, opts.size);
         const step = opts.size * opts.line_height;
+        const top = opts.size * self.ascent(opts.font);
         for (lines, 0..) |ln, i| {
-            const baseline = y + opts.size * opts.font.ascent() + @as(f32, @floatFromInt(i)) * step;
+            const baseline = y + top + @as(f32, @floatFromInt(i)) * step;
             const anchor = switch (opts.@"align") {
                 .left => x,
                 .center => x + box_width / 2,
                 .right => x + box_width,
             };
-            try self.writeLine(anchor, baseline, ln, opts);
+            try self.writeLine(anchor, baseline, run, ln, opts);
         }
         return @as(f32, @floatFromInt(lines.len)) * step;
     }
 
     /// The height `textBox` would take for `str` at `box_width`.
     pub fn measureText(self: *Document, str: []const u8, box_width: f32, opts: TextOptions) !f32 {
-        const lines = try self.wrapLines(str, box_width, opts);
+        const run = try self.encodeRun(str, opts.font, false);
+        const lines = try text_mod.wrap(self.alloc(), run, box_width, opts.size);
         return @as(f32, @floatFromInt(lines.len)) * opts.size * opts.line_height;
     }
 
@@ -319,7 +411,8 @@ pub const Document = struct {
     /// new page. Moves the cursor below the text.
     pub fn paragraph(self: *Document, str: []const u8, opts: TextOptions) !void {
         const left = self.options.margin;
-        const lines = try self.wrapLines(str, self.contentWidth(), opts);
+        const run = try self.encodeRun(str, opts.font, false);
+        const lines = try text_mod.wrap(self.alloc(), run, self.contentWidth(), opts.size);
         const step = opts.size * opts.line_height;
         for (lines) |ln| {
             try self.ensureSpace(step);
@@ -328,20 +421,48 @@ pub const Document = struct {
                 .center => left + self.contentWidth() / 2,
                 .right => left + self.contentWidth(),
             };
-            try self.writeLine(anchor, self.y + opts.size * opts.font.ascent(), ln, opts);
+            try self.writeLine(anchor, self.y + opts.size * self.ascent(opts.font), run, ln, opts);
             self.y += step;
         }
     }
 
-    fn wrapLines(self: *Document, str: []const u8, box_width: f32, opts: TextOptions) ![][]const u8 {
-        const encoded = try self.encode(str);
-        return text_mod.wrap(self.alloc(), encoded, box_width, opts.font, opts.size);
+    const Encoded = struct { code: u16, width: u16 };
+
+    /// One character in `font`: its code and width. A character the font
+    /// lacks is written as `?` (or the font's missing glyph when it has no
+    /// `?` either). A line break has no width; a tab is a space.
+    fn encodeChar(self: *Document, font: Font, cp_in: u21) Encoded {
+        const cp: u21 = if (cp_in == '\t') ' ' else cp_in;
+        if (font.standard()) |f| {
+            if (cp == '\n') return .{ .code = '\n', .width = 0 };
+            const b = fonts.winAnsi(cp) orelse '?';
+            return .{ .code = b, .width = fonts.charWidth(b, f) };
+        }
+        const tt = &self.embedded.items[font.embedded].tt;
+        if (cp == '\n') return .{ .code = 0, .width = 0 };
+        var gid = tt.glyphIndex(cp);
+        if (gid == 0) gid = tt.glyphIndex('?');
+        return .{ .code = gid, .width = tt.advance1000(gid) };
     }
 
-    fn encode(self: *Document, str: []const u8) ![]u8 {
-        var out: std.ArrayList(u8) = .empty;
-        try fonts.encode(self.alloc(), &out, str);
-        return out.items;
+    /// `str` as a run of codes in `font`; `flat` turns line breaks into
+    /// spaces (for a single line).
+    fn encodeRun(self: *Document, str: []const u8, font: Font, flat: bool) !text_mod.Run {
+        const a = self.alloc();
+        var codes: std.ArrayList(u16) = .empty;
+        var widths: std.ArrayList(u16) = .empty;
+        var cps: std.ArrayList(u21) = .empty;
+        var i: usize = 0;
+        while (i < str.len) {
+            var cp = nextCodepoint(str, &i);
+            if (flat and (cp == '\n' or cp == '\r')) cp = ' ';
+            if (cp == '\r') continue;
+            const e = self.encodeChar(font, cp);
+            try codes.append(a, e.code);
+            try widths.append(a, e.width);
+            try cps.append(a, cp);
+        }
+        return .{ .codes = codes.items, .widths = widths.items, .cps = cps.items };
     }
 
     // ── Shapes ──────────────────────────────────────────────────────────
@@ -494,11 +615,20 @@ pub const Document = struct {
         const info_id = 3;
         var next: usize = 4;
 
-        var font_ids: std.EnumArray(Font, usize) = .initFill(0);
+        var font_ids: std.EnumArray(fonts.Standard, usize) = .initFill(0);
         var it = self.fonts_used.iterator();
         while (it.next()) |f| {
             font_ids.set(f, next);
             next += 1;
+        }
+        // An embedded font is five objects (Type0 font, CIDFont, descriptor,
+        // font file, ToUnicode map); one never drawn with is left out.
+        const embedded_ids = try a.alloc(usize, self.embedded.items.len);
+        for (self.embedded.items, 0..) |e, i| {
+            embedded_ids[i] = 0;
+            if (!e.isUsed()) continue;
+            embedded_ids[i] = next;
+            next += 5;
         }
         const image_ids = try a.alloc(usize, self.images.items.len);
         const mask_ids = try a.alloc(usize, self.images.items.len);
@@ -550,6 +680,10 @@ pub const Document = struct {
             try w.print("{d} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /{s} /Encoding /WinAnsiEncoding >>\nendobj\n", .{ font_ids.get(f), f.baseName() });
         }
 
+        for (self.embedded.items, embedded_ids) |e, id| {
+            if (id != 0) try writeEmbeddedFont(a, out, offsets, e, id);
+        }
+
         for (self.images.items, 0..) |stored, i| {
             const img = stored.encoded;
             offsets[image_ids[i]] = out.written().len;
@@ -580,10 +714,16 @@ pub const Document = struct {
 
             offsets[page_ids[i]] = out.written().len;
             try w.print("{d} 0 obj\n<< /Type /Page /Parent {d} 0 R /MediaBox [0 0 {d:.2} {d:.2}] /Contents {d} 0 R /Resources <<", .{ page_ids[i], pages_id, p.size.width, p.size.height, content_ids[i] });
-            if (self.fonts_used.count() > 0) {
+            const any_embedded = for (embedded_ids) |id| {
+                if (id != 0) break true;
+            } else false;
+            if (self.fonts_used.count() > 0 or any_embedded) {
                 try w.writeAll(" /Font <<");
                 it = self.fonts_used.iterator();
                 while (it.next()) |f| try w.print(" /F{d} {d} 0 R", .{ @backingInt(f), font_ids.get(f) });
+                for (embedded_ids, 0..) |id, n| {
+                    if (id != 0) try w.print(" /E{d} {d} 0 R", .{ n, id });
+                }
                 try w.writeAll(" >>");
             }
             if (self.images.items.len > 0) {
@@ -613,6 +753,129 @@ pub const Document = struct {
         try w.print("trailer\n<< /Size {d} /Root {d} 0 R /Info {d} 0 R >>\nstartxref\n{d}\n%%EOF\n", .{ object_count + 1, catalog_id, info_id, xref });
     }
 };
+
+/// Writes the five objects of an embedded TrueType font, numbered from
+/// `id`: a Type0 font (Identity-H: two-byte codes that are glyph numbers),
+/// its CIDFont with the widths of the glyphs used, the font descriptor,
+/// the subset font file, and a ToUnicode map so that copying the text or
+/// extracting it gives the characters back.
+fn writeEmbeddedFont(a: std.mem.Allocator, out: *std.Io.Writer.Allocating, offsets: []usize, e: EmbeddedFont, id: usize) !void {
+    const w = &out.writer;
+    const tt = &e.tt;
+
+    // A subset is named with six capital letters and "+", from the set of
+    // glyphs it holds: two subsets of one font never share a name.
+    var hasher = std.hash.Wyhash.init(e.hash);
+    hasher.update(std.mem.sliceAsBytes(e.used));
+    var h = hasher.final();
+    var tag: [6]u8 = undefined;
+    for (&tag) |*ch| {
+        ch.* = 'A' + @as(u8, @intCast(h % 26));
+        h /= 26;
+    }
+    const name = try std.fmt.allocPrint(a, "{s}+{s}", .{ &tag, tt.postScriptName() });
+
+    offsets[id] = out.written().len;
+    try w.print("{d} 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /{s} /Encoding /Identity-H /DescendantFonts [{d} 0 R] /ToUnicode {d} 0 R >>\nendobj\n", .{ id, name, id + 1, id + 4 });
+
+    offsets[id + 1] = out.written().len;
+    try w.print("{d} 0 obj\n<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{s} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor {d} 0 R /CIDToGIDMap /Identity /DW 1000 /W [", .{ id + 1, name, id + 2 });
+    // Runs of consecutive glyphs: `first [w1 w2 ...]`.
+    var gid: usize = 0;
+    while (gid < e.used.len) {
+        if (!e.used[gid]) {
+            gid += 1;
+            continue;
+        }
+        try w.print(" {d} [", .{gid});
+        while (gid < e.used.len and e.used[gid]) : (gid += 1) try w.print(" {d}", .{tt.advance1000(@intCast(gid))});
+        try w.writeAll(" ]");
+    }
+    try w.writeAll(" ] >>\nendobj\n");
+
+    var flags: u32 = 4; // symbolic: the codes are glyph numbers, not a standard encoding
+    if (tt.fixed_pitch) flags |= 1;
+    if (tt.italic_angle != 0) flags |= 64;
+    offsets[id + 2] = out.written().len;
+    try w.print("{d} 0 obj\n<< /Type /FontDescriptor /FontName /{s} /Flags {d} /FontBBox [{d} {d} {d} {d}] /ItalicAngle {d:.2} /Ascent {d} /Descent {d} /CapHeight {d} /StemV 80 /FontFile2 {d} 0 R >>\nendobj\n", .{
+        id + 2,                  name,
+        flags,                   tt.scale(tt.bbox[0]),
+        tt.scale(tt.bbox[1]),    tt.scale(tt.bbox[2]),
+        tt.scale(tt.bbox[3]),    tt.italic_angle,
+        tt.scale(tt.ascent),     tt.scale(tt.descent),
+        tt.scale(tt.cap_height), id + 3,
+    });
+
+    const font_file = try tt.subset(a, e.used);
+    const compressed = try codec.zlibCompress(a, font_file);
+    offsets[id + 3] = out.written().len;
+    try w.print("{d} 0 obj\n<< /Length {d} /Length1 {d} /Filter /FlateDecode >>\nstream\n", .{ id + 3, compressed.len, font_file.len });
+    try w.writeAll(compressed);
+    try w.writeAll("\nendstream\nendobj\n");
+
+    var cmap: std.ArrayList(u8) = .empty;
+    try cmap.appendSlice(a,
+        \\/CIDInit /ProcSet findresource begin
+        \\12 dict begin
+        \\begincmap
+        \\/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+        \\/CMapName /Adobe-Identity-UCS def
+        \\/CMapType 2 def
+        \\1 begincodespacerange
+        \\<0000> <FFFF>
+        \\endcodespacerange
+        \\
+    );
+    // At most 100 entries per bfchar block.
+    var pending: std.ArrayList(u8) = .empty;
+    var count: usize = 0;
+    for (e.unicode, 0..) |cp, g| {
+        if (cp == 0) continue;
+        try pending.print(a, "<{X:0>4}> <", .{g});
+        if (cp >= 0x10000) {
+            const v = cp - 0x10000;
+            try pending.print(a, "{X:0>4}{X:0>4}", .{ 0xD800 + (v >> 10), 0xDC00 + (v & 0x3FF) });
+        } else {
+            try pending.print(a, "{X:0>4}", .{cp});
+        }
+        try pending.appendSlice(a, ">\n");
+        count += 1;
+        if (count == 100) {
+            try cmap.print(a, "100 beginbfchar\n{s}endbfchar\n", .{pending.items});
+            pending.clearRetainingCapacity();
+            count = 0;
+        }
+    }
+    if (count > 0) try cmap.print(a, "{d} beginbfchar\n{s}endbfchar\n", .{ count, pending.items });
+    try cmap.appendSlice(a,
+        \\endcmap
+        \\CMapName currentdict /CMapResource defineresource pop
+        \\end
+        \\end
+        \\
+    );
+    const cmap_z = try codec.zlibCompress(a, cmap.items);
+    offsets[id + 4] = out.written().len;
+    try w.print("{d} 0 obj\n<< /Length {d} /Filter /FlateDecode >>\nstream\n", .{ id + 4, cmap_z.len });
+    try w.writeAll(cmap_z);
+    try w.writeAll("\nendstream\nendobj\n");
+}
+
+/// Decodes the UTF-8 character at `i.*` and moves past it; invalid bytes
+/// give U+FFFD, one byte at a time.
+fn nextCodepoint(str: []const u8, i: *usize) u21 {
+    const len = std.unicode.utf8ByteSequenceLength(str[i.*]) catch {
+        i.* += 1;
+        return 0xFFFD;
+    };
+    if (i.* + len > str.len) {
+        i.* = str.len;
+        return 0xFFFD;
+    }
+    const cp = std.unicode.utf8Decode(str[i.* .. i.* + len]) catch 0xFFFD;
+    i.* += len;
+    return cp;
+}
 
 /// A PDF literal string: `(...)` with `(`, `)` and `\` escaped and the
 /// line-break bytes written as escapes, so the string stays on one line.
@@ -903,4 +1166,141 @@ test "line breaks in a literal string are escaped" {
     defer list.deinit(t.allocator);
     try writeLiteral(t.allocator, &list, "a\\b\r\n(c)");
     try t.expectEqualStrings("(a\\\\b\\r\\n\\(c\\))", list.items);
+}
+
+// ── Embedded fonts ──────────────────────────────────────────────────────
+
+/// The decompressed data of the first stream whose dictionary contains
+/// `marker`.
+fn streamAfter(pdf: []const u8, marker: []const u8) ![]u8 {
+    const at = std.mem.indexOf(u8, pdf, marker) orelse return error.TestUnexpectedResult;
+    const start = std.mem.indexOfPos(u8, pdf, at, ">>\nstream\n").? + ">>\nstream\n".len;
+    const end = std.mem.indexOfPos(u8, pdf, start, "\nendstream").?;
+    return codec.zlibDecompress(t.allocator, pdf[start..end], 1 << 20);
+}
+
+test "text in an embedded font is written as glyph numbers, with the font embedded" {
+    const font_bytes = try truetype.testing.font(t.allocator, .{});
+    defer t.allocator.free(font_bytes);
+    var doc = try Document.init(t.allocator, .{ .compress = false });
+    defer doc.deinit();
+    const f = try doc.addFont(font_bytes);
+    try doc.text(10, 20, "AB", .{ .font = f, .size = 10 });
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    try t.expect(contains(pdf, "BT /E0 10.00 Tf"));
+    try t.expect(contains(pdf, "<00010002> Tj"));
+    try t.expect(contains(pdf, "/Subtype /Type0"));
+    try t.expect(contains(pdf, "/Encoding /Identity-H"));
+    try t.expect(contains(pdf, "/Subtype /CIDFontType2"));
+    try t.expect(contains(pdf, "/CIDToGIDMap /Identity"));
+    try t.expect(contains(pdf, "/W [ 1 [ 550 600 ] ]"));
+    try t.expect(contains(pdf, "/Font << /E0 "));
+    // Capital letters, a plus and the PostScript name.
+    const at = std.mem.indexOf(u8, pdf, "/BaseFont /").? + "/BaseFont /".len;
+    for (pdf[at .. at + 6]) |ch| try t.expect(std.ascii.isUpper(ch));
+    try t.expect(std.mem.startsWith(u8, pdf[at + 6 ..], "+Test-Sans "));
+    // The descriptor in thousandths of the size.
+    try t.expect(contains(pdf, "/FontBBox [-50 -200 950 900] /ItalicAngle -12.00 /Ascent 800 /Descent -200 /CapHeight 700"));
+    try t.expect(contains(pdf, "/Flags 68"));
+}
+
+test "the embedded font file is a valid subset holding only the glyphs drawn" {
+    const font_bytes = try truetype.testing.font(t.allocator, .{});
+    defer t.allocator.free(font_bytes);
+    var doc = try Document.init(t.allocator, .{});
+    defer doc.deinit();
+    try doc.text(10, 20, "A", .{ .font = try doc.addFont(font_bytes) });
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    const file = try streamAfter(pdf, "/Length1 ");
+    defer t.allocator.free(file);
+    const len1_at = std.mem.indexOf(u8, pdf, "/Length1 ").? + "/Length1 ".len;
+    const len1 = try std.fmt.parseInt(usize, pdf[len1_at..std.mem.indexOfScalarPos(u8, pdf, len1_at, ' ').?], 10);
+    try t.expectEqual(len1, file.len);
+    try t.expectEqual(@as(u32, 0xB1B0AFBA), truetype.checksum(file));
+    try t.expect(file.len < font_bytes.len + 64);
+    // Glyph B (2) had its outline dropped: its filler bytes are gone, A's stay.
+    const a_filler: [6]u8 = @splat(0xA1);
+    const b_filler: [6]u8 = @splat(0xA2);
+    try t.expect(std.mem.indexOf(u8, file, &a_filler) != null);
+    try t.expect(std.mem.indexOf(u8, file, &b_filler) == null);
+}
+
+test "ToUnicode maps the glyphs back to their characters, beyond the BMP too" {
+    const font_bytes = try truetype.testing.font(t.allocator, .{});
+    defer t.allocator.free(font_bytes);
+    var doc = try Document.init(t.allocator, .{});
+    defer doc.deinit();
+    try doc.text(10, 20, "AÁЖ😀", .{ .font = try doc.addFont(font_bytes) });
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    // The object /ToUnicode names.
+    const ref_at = std.mem.indexOf(u8, pdf, "/ToUnicode ").? + "/ToUnicode ".len;
+    const id = pdf[ref_at..std.mem.indexOfScalarPos(u8, pdf, ref_at, ' ').?];
+    var buf: [32]u8 = undefined;
+    const cmap = try streamAfter(pdf, try std.fmt.bufPrint(&buf, "\n{s} 0 obj\n", .{id}));
+    defer t.allocator.free(cmap);
+    try t.expect(contains(cmap, "4 beginbfchar"));
+    try t.expect(contains(cmap, "<0001> <0041>"));
+    try t.expect(contains(cmap, "<0003> <00C1>"));
+    try t.expect(contains(cmap, "<0007> <0416>"));
+    try t.expect(contains(cmap, "<0008> <D83DDE00>"));
+}
+
+test "a character the embedded font lacks is written as its question mark" {
+    const font_bytes = try truetype.testing.font(t.allocator, .{});
+    defer t.allocator.free(font_bytes);
+    var doc = try Document.init(t.allocator, .{ .compress = false });
+    defer doc.deinit();
+    const f = try doc.addFont(font_bytes);
+    try doc.text(10, 20, "AZ", .{ .font = f });
+    try t.expect(contains(doc.pages.items[0].content.items, "<00010005> Tj"));
+}
+
+test "embedded fonts: measured, wrapped, added once, and left out when unused" {
+    const font_bytes = try truetype.testing.font(t.allocator, .{});
+    defer t.allocator.free(font_bytes);
+    var doc = try Document.init(t.allocator, .{ .compress = false });
+    defer doc.deinit();
+    const f = try doc.addFont(font_bytes);
+    try t.expectEqual(f, try doc.addFont(font_bytes));
+    try t.expectApproxEqAbs(@as(f32, 11.5), doc.textWidth("AB", f, 10), 0.001);
+    // "AB AB" at 10 points: each "AB" is 11.5 wide, the space 8.
+    const h = try doc.textBox(0, 0, 20, "AB AB", .{ .font = f, .size = 10 });
+    try t.expectApproxEqAbs(@as(f32, 2 * 12.5), h, 0.001);
+
+    var unused = try Document.init(t.allocator, .{});
+    defer unused.deinit();
+    _ = try unused.addFont(font_bytes);
+    const pdf = try render(&unused);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    try t.expect(!contains(pdf, "/Type0"));
+}
+
+test "standard and embedded fonts in one document, and in a table" {
+    const font_bytes = try truetype.testing.font(t.allocator, .{});
+    defer t.allocator.free(font_bytes);
+    var doc = try Document.init(t.allocator, .{});
+    defer doc.deinit();
+    const f = try doc.addFont(font_bytes);
+    try doc.text(10, 20, "Helvetica", .{});
+    try doc.table(&.{.{ .header = "AB", .width = 100 }}, &.{&.{"BA"}}, .{ .font = f, .header_font = f });
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    try t.expect(contains(pdf, "/Font << /F0 "));
+    try t.expect(contains(pdf, " /E0 "));
+}
+
+test "addFont refuses what it cannot embed" {
+    var doc = try Document.init(t.allocator, .{});
+    defer doc.deinit();
+    try t.expectError(error.InvalidFont, doc.addFont("not a font"));
+    const restricted = try truetype.testing.font(t.allocator, .{ .fs_type = 2 });
+    defer t.allocator.free(restricted);
+    try t.expectError(error.FontNotEmbeddable, doc.addFont(restricted));
 }

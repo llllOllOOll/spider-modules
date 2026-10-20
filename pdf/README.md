@@ -4,10 +4,14 @@ PDF documents for Spider apps: invoices, receipts, statements, reports and
 tickets, drawn in Zig. No external tool (no headless browser, no
 LibreOffice) and no dependency beyond `std`.
 
-- **Text** in the 14-font-standard Helvetica and Courier (regular, bold,
-  oblique, bold oblique), written as WinAnsi: the Latin-1 accents, curly
-  quotes, dashes, the bullet and the euro sign. Widths are the fonts' own,
-  so right-aligned and centered text lines up.
+- **Text** in the standard Helvetica and Courier (regular, bold, oblique,
+  bold oblique), which every reader has, written as WinAnsi: the Latin-1
+  accents, curly quotes, dashes, the bullet and the euro sign. Widths are
+  the fonts' own, so right-aligned and centered text lines up.
+- **Embedded TrueType fonts** (`addFont`): any .ttf, any script the font
+  covers (Cyrillic, Greek, Central European, Vietnamese, emoji...). Only the
+  glyphs drawn are embedded (a 600 KB font adds about 25 KB), with a
+  Unicode map so text can be copied, searched and extracted.
 - **Wrapped text**: `textBox` (in a box, left, centered or right) and
   `paragraph` (between the margins, flowing over pages line by line).
 - **Tables** that flow over pages: cells wrap, rows grow to their tallest
@@ -63,6 +67,19 @@ fn receipt(c: *spider.Ctx) !spider.Response {
 }
 ```
 
+Any other font, any script:
+
+```zig
+const inter = try doc.addFont(@embedFile("fonts/Inter-Regular.ttf"));
+try doc.paragraph("Привет, Αθήνα, Zażółć gęślą jaźń", .{ .font = inter, .size = 12 });
+const w = doc.textWidth("measured in that font", inter, 12);
+```
+
+The font's bytes must outlive the document (`@embedFile`, or freed after
+`toBytes`). An `.otf` with PostScript outlines (CFF) is refused with
+`error.UnsupportedFont`, a font whose license forbids embedding with
+`error.FontNotEmbeddable`.
+
 Page numbers once the page count is known:
 
 ```zig
@@ -81,9 +98,12 @@ settings: mounting it with `server.mountModules` is optional.
 
 ## Limits (for now)
 
-- Only the standard fonts, so only WinAnsi characters; anything else is
-  written as `?`. Embedded TrueType fonts (any font, any script) are the
-  next phase.
+- The standard fonts write WinAnsi characters only (anything else becomes
+  `?`); use an embedded font for the rest. A character an embedded font
+  lacks is written as its `?`.
+- Embedded fonts: TrueType outlines only (no CFF `.otf`, no `.ttc`
+  collections); no kerning, ligatures or complex shaping (Arabic, Indic
+  scripts need a shaper); text runs left to right.
 - PNG with 16 bits per channel and interlaced PNG are refused by name;
   images over 10,000 pixels on a side too.
 - It writes PDFs; it does not read or edit existing ones.
@@ -92,8 +112,9 @@ settings: mounting it with `server.mountModules` is optional.
 
 ```sh
 zig build test-pdf        # unit tests, including a request through Spider
-pdf/scripts/check.sh      # the sample document through qpdf and pdftotext
+pdf/scripts/check.sh      # the sample through qpdf, pdftotext and pdffonts (PDF_FONT=x.ttf, or Noto Sans)
 zig build pdf-sample      # writes zig-out/pdf-sample.pdf to open in readers
+zig build pdf-sample -Dpdf-font=x.ttf   # with a page in an embedded font
 ```
 
 `pdf/examples/sample.zig` uses every feature; open its output in a few

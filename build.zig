@@ -76,8 +76,9 @@ pub fn build(b: *std.Build) void {
     });
     const run_sample = b.addRunArtifact(pdf_sample);
     const sample_pdf = run_sample.addOutputFileArg("pdf-sample.pdf");
+    if (b.option([]const u8, "pdf-font", "pdf-sample: a TrueType font to embed on an extra page")) |font| run_sample.addArg(font);
     const install_sample = b.addInstallFile(sample_pdf, "pdf-sample.pdf");
-    b.step("pdf-sample", "pdf: write zig-out/pdf-sample.pdf").dependOn(&install_sample.step);
+    b.step("pdf-sample", "pdf: write zig-out/pdf-sample.pdf (-Dpdf-font=x.ttf adds a page in that font)").dependOn(&install_sample.step);
 }
 
 fn dbTest(

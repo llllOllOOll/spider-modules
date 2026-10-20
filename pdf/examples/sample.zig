@@ -1,6 +1,8 @@
 //! A sample invoice that uses every feature of spider_pdf, written to the
-//! path given as the first argument (`zig build pdf-sample`). Open it in a
-//! few PDF readers after a change; `pdf/scripts/check.sh` validates it.
+//! path given as the first argument (`zig build pdf-sample`). A TrueType
+//! font given as the second argument (`zig build pdf-sample -Dpdf-font=font.ttf`)
+//! adds a page of text in it, in scripts WinAnsi lacks. Open the result in
+//! a few PDF readers after a change; `pdf/scripts/check.sh` validates it.
 
 const std = @import("std");
 const pdf = @import("spider_pdf");
@@ -30,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
     try doc.text(100, 80, "Issued on 19/10/2026 · due on 05/11/2026", .{ .size = 10, .color = pdf.Color.gray });
     const right = doc.width() - 40;
     try doc.text(right, 62, "spiderme.org", .{ .size = 10, .color = accent, .@"align" = .right });
-    const link_w = pdf.Document.textWidth("spiderme.org", .helvetica, 10);
+    const link_w = doc.textWidth("spiderme.org", .helvetica, 10);
     try doc.link(right - link_w, 52, link_w, 12, "https://spiderme.org");
     try doc.line(40, 100, right, 100, .{ .color = pdf.Color.light_gray });
 
@@ -89,6 +91,28 @@ pub fn main(init: std.process.Init) !void {
     try doc.addPageSized(pdf.Size.a4.landscape());
     try doc.text(40, 60, "A landscape page", .{ .font = .helvetica_bold, .size = 18 });
     _ = try doc.textBox(40, 80, 300, "Centered text in a box of 300 points, wrapped over several lines as needed by its length.", .{ .@"align" = .center });
+
+    // An embedded TrueType font, when one is given.
+    if (args.len >= 3) {
+        const font_bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, args[2], init.arena.allocator(), .limited(32 << 20));
+        const font = try doc.addFont(font_bytes);
+        try doc.addPage();
+        try doc.text(40, 60, "An embedded TrueType font", .{ .font = font, .size = 20, .color = accent });
+        doc.y = 80;
+        try doc.paragraph("Русский: Съешь же ещё этих мягких французских булок.", .{ .font = font });
+        try doc.paragraph("Ελληνικά: Ξεσκεπάζω την ψυχοφθόρα βδελυγμία.", .{ .font = font });
+        try doc.paragraph("Polski: Zażółć gęślą jaźń. Türkçe: Pijamalı hasta yağız şoföre çabucak güvendi.", .{ .font = font });
+        try doc.paragraph("Português: Não há ação sem coração — “aspas”, € e º.", .{ .font = font });
+        doc.moveDown(10);
+        try doc.table(&.{
+            .{ .header = "Город", .width = 200 },
+            .{ .header = "Πόλη", .width = 200 },
+            .{ .header = "Ł", .width = 115, .@"align" = .right },
+        }, &.{
+            &.{ "Москва", "Αθήνα", "1" },
+            &.{ "Санкт-Петербург", "Θεσσαλονίκη", "2" },
+        }, .{ .font = font, .header_font = font });
+    }
 
     // Page numbers, once the page count is known.
     const total = doc.pageCount();

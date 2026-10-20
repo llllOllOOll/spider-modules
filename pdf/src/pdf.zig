@@ -3,7 +3,9 @@
 //! dependency beyond `std`.
 //!
 //! Text in the standard fonts (Helvetica and Courier, with the Latin-1
-//! accents), text wrapped in boxes and paragraphs that flow over pages,
+//! accents) or in embedded TrueType fonts (any script the font has; only
+//! the glyphs used are embedded), text wrapped in boxes and paragraphs
+//! that flow over pages,
 //! tables with repeated headers, lines, rectangles (rounded), ellipses,
 //! PNG (with transparency) and JPEG images, links, document properties,
 //! and compressed output. Coordinates are points from the top-left corner.
@@ -50,6 +52,7 @@ pub const TableOptions = document.TableOptions;
 pub const Error = document.Error;
 pub const TableError = @import("table.zig").Error;
 pub const ImageError = @import("image.zig").Error;
+pub const FontError = @import("truetype.zig").Error;
 
 pub const spider_module = spider.module(.{
     .name = "pdf",
@@ -84,6 +87,7 @@ test {
     _ = @import("image.zig");
     _ = @import("document.zig");
     _ = @import("table.zig");
+    _ = @import("truetype.zig");
 }
 
 test "the module manifest is pdf 0.1.0" {

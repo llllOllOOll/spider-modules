@@ -12,7 +12,7 @@
 
 const std = @import("std");
 
-pub const Font = enum {
+pub const Standard = enum {
     helvetica,
     helvetica_bold,
     helvetica_oblique,
@@ -23,7 +23,7 @@ pub const Font = enum {
     courier_bold_oblique,
 
     /// The font's PostScript name, as the PDF names it.
-    pub fn baseName(self: Font) []const u8 {
+    pub fn baseName(self: Standard) []const u8 {
         return switch (self) {
             .helvetica => "Helvetica",
             .helvetica_bold => "Helvetica-Bold",
@@ -38,22 +38,22 @@ pub const Font = enum {
 
     /// How far the capital letters rise above the baseline, in units of
     /// the font size (from the AFM files' Ascender).
-    pub fn ascent(self: Font) f32 {
+    pub fn ascent(self: Standard) f32 {
         return switch (self) {
             .helvetica, .helvetica_bold, .helvetica_oblique, .helvetica_bold_oblique => 0.718,
             else => 0.629,
         };
     }
 
-    fn isBold(self: Font) bool {
+    fn isBold(self: Standard) bool {
         return switch (self) {
             .helvetica_bold, .helvetica_bold_oblique, .courier_bold, .courier_bold_oblique => true,
             else => false,
         };
     }
 
-    fn isCourier(self: Font) bool {
-        return @backingInt(self) >= @backingInt(Font.courier);
+    fn isCourier(self: Standard) bool {
+        return @backingInt(self) >= @backingInt(Standard.courier);
     }
 };
 
@@ -120,14 +120,14 @@ pub fn winAnsi(cp: u21) ?u8 {
 }
 
 /// The width of WinAnsi-encoded `text` in points, at `size`.
-pub fn width(text: []const u8, font: Font, size: f32) f32 {
+pub fn width(text: []const u8, font: Standard, size: f32) f32 {
     var units: u32 = 0;
     for (text) |b| units += charWidth(b, font);
     return @as(f32, @floatFromInt(units)) / 1000.0 * size;
 }
 
 /// The width of UTF-8 `text` in points, at `size`.
-pub fn widthUtf8(text: []const u8, font: Font, size: f32) f32 {
+pub fn widthUtf8(text: []const u8, font: Standard, size: f32) f32 {
     var units: u32 = 0;
     var i: usize = 0;
     while (i < text.len) {
@@ -140,7 +140,7 @@ pub fn widthUtf8(text: []const u8, font: Font, size: f32) f32 {
 }
 
 /// The width of one WinAnsi byte, in thousandths of the font size.
-pub fn charWidth(b: u8, font: Font) u16 {
+pub fn charWidth(b: u8, font: Standard) u16 {
     if (font.isCourier()) return 600;
     const bold = font.isBold();
     if (b >= 32 and b <= 126) return if (bold) helvetica_bold[b - 32] else helvetica[b - 32];
