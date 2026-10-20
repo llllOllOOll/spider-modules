@@ -18,6 +18,9 @@ LibreOffice) and no dependency beyond `std`.
   cell, the header repeats on each page, optional stripes and grid.
 - **Shapes**: lines (dashed), rectangles (filled, outlined, rounded),
   ellipses and circles.
+- **Opacity** on text, shapes, lines and images, and **rotation** of text
+  and images: a diagonal translucent watermark is
+  `.{ .size = 110, .opacity = 0.08, .rotate = 35, .@"align" = .center }`.
 - **Images**: PNG (gray, RGB, palette, with transparency kept as a soft
   mask) and JPEG (embedded as it is). The same image drawn many times is
   stored once.

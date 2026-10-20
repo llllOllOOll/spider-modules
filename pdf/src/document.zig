@@ -121,6 +121,12 @@ pub const TextOptions = struct {
     @"align": Align = .left,
     /// Distance between baselines in wrapped text, as a multiple of `size`.
     line_height: f32 = 1.25,
+    /// 1 is opaque, 0 invisible (a watermark is around 0.15).
+    opacity: f32 = 1,
+    /// Degrees counterclockwise, around the anchor point (`x` and the
+    /// baseline): 45 writes a line going up to the right. For `text` only;
+    /// boxes and paragraphs ignore it.
+    rotate: f32 = 0,
 };
 
 pub const LineOptions = struct {
@@ -128,6 +134,8 @@ pub const LineOptions = struct {
     width: f32 = 1,
     /// Dash and gap lengths, e.g. `.{ 3, 2 }`; null draws a solid line.
     dash: ?[2]f32 = null,
+    /// 1 is opaque, 0 invisible.
+    opacity: f32 = 1,
 };
 
 pub const ShapeOptions = struct {
@@ -138,6 +146,8 @@ pub const ShapeOptions = struct {
     line_width: f32 = 1,
     /// Corner radius of a rectangle.
     radius: f32 = 0,
+    /// 1 is opaque, 0 invisible; applies to the fill and the outline.
+    opacity: f32 = 1,
 };
 
 pub const ImageOptions = struct {
@@ -145,6 +155,10 @@ pub const ImageOptions = struct {
     /// given neither, one pixel is one point.
     width: ?f32 = null,
     height: ?f32 = null,
+    /// 1 is opaque, 0 invisible.
+    opacity: f32 = 1,
+    /// Degrees counterclockwise, around the image's center.
+    rotate: f32 = 0,
 };
 
 /// An image added to the document, drawn with `Document.image` as many
@@ -201,6 +215,8 @@ pub const Document = struct {
     images: std.ArrayList(StoredImage) = .empty,
     fonts_used: std.EnumSet(fonts.Standard) = .empty,
     embedded: std.ArrayList(EmbeddedFont) = .empty,
+    /// Opacities in use, in thousandths: ExtGState /GS{index}.
+    alphas: std.ArrayList(u16) = .empty,
     /// The flowing cursor: where the next `paragraph` or `table` starts,
     /// in points from the top of the current page.
     y: f32 = 0,
@@ -348,6 +364,11 @@ pub const Document = struct {
         };
         const a = self.alloc();
         const c = &self.page().content;
+        const translucent = opts.opacity < 1;
+        if (translucent) {
+            try c.appendSlice(a, "q ");
+            try self.setOpacity(opts.opacity);
+        }
         if (opts.font.standard()) |std_font| {
             self.fonts_used.insert(std_font);
             try c.print(a, "BT /F{d} {d:.2} Tf ", .{ @backingInt(std_font), opts.size });
@@ -355,7 +376,16 @@ pub const Document = struct {
             try c.print(a, "BT /E{d} {d:.2} Tf ", .{ opts.font.embedded, opts.size });
         }
         try self.color(opts.color, "rg");
-        try c.print(a, "{d:.2} {d:.2} Td ", .{ left, self.height() - y });
+        if (opts.rotate == 0) {
+            try c.print(a, "{d:.2} {d:.2} Td ", .{ left, self.height() - y });
+        } else {
+            // The alignment moves the text along its own, turned, baseline.
+            const rad = opts.rotate * std.math.pi / 180;
+            const cos = @cos(rad);
+            const sin = @sin(rad);
+            const dx = left - x;
+            try c.print(a, "{d:.4} {d:.4} {d:.4} {d:.4} {d:.2} {d:.2} Tm ", .{ cos, sin, -sin, cos, x + dx * cos, self.height() - y + dx * sin });
+        }
         if (opts.font.standard() != null) {
             const bytes = try a.alloc(u8, ln.end - ln.start);
             for (run.codes[ln.start..ln.end], bytes) |code, *b| b.* = @intCast(code);
@@ -371,7 +401,21 @@ pub const Document = struct {
             }
             try c.append(a, '>');
         }
-        try c.appendSlice(a, " Tj ET\n");
+        try c.appendSlice(a, if (translucent) " Tj ET Q\n" else " Tj ET\n");
+    }
+
+    /// Sets the opacity for what follows (inside a q/Q): an ExtGState shared
+    /// by every drawing with the same opacity.
+    fn setOpacity(self: *Document, opacity: f32) !void {
+        const v = std.math.clamp(opacity, 0, 1);
+        const key: u16 = @intFromFloat(@round(v * 1000));
+        const index = for (self.alphas.items, 0..) |k, i| {
+            if (k == key) break i;
+        } else blk: {
+            try self.alphas.append(self.alloc(), key);
+            break :blk self.alphas.items.len - 1;
+        };
+        try self.page().content.print(self.alloc(), "/GS{d} gs ", .{index});
     }
 
     fn ascent(self: *Document, font: Font) f32 {
@@ -471,6 +515,7 @@ pub const Document = struct {
     pub fn line(self: *Document, x1: f32, y1: f32, x2: f32, y2: f32, opts: LineOptions) !void {
         const c = &self.page().content;
         try c.print(self.alloc(), "q {d:.2} w ", .{opts.width});
+        if (opts.opacity < 1) try self.setOpacity(opts.opacity);
         if (opts.dash) |d| try c.print(self.alloc(), "[{d:.2} {d:.2}] 0 d ", .{ d[0], d[1] });
         try self.color(opts.color, "RG");
         try c.print(self.alloc(), "{d:.2} {d:.2} m {d:.2} {d:.2} l S Q\n", .{ x1, self.height() - y1, x2, self.height() - y2 });
@@ -530,6 +575,7 @@ pub const Document = struct {
     fn beginShape(self: *Document, opts: ShapeOptions) !void {
         const c = &self.page().content;
         try c.print(self.alloc(), "q {d:.2} w ", .{opts.line_width});
+        if (opts.opacity < 1) try self.setOpacity(opts.opacity);
         if (opts.fill) |f| try self.color(f, "rg");
         try self.color(opts.stroke orelse Color.black, "RG");
     }
@@ -572,7 +618,19 @@ pub const Document = struct {
         const ph: f32 = @floatFromInt(img.height);
         const w = opts.width orelse if (opts.height) |h| h * pw / ph else pw;
         const h = opts.height orelse if (opts.width) |ow| ow * ph / pw else ph;
-        try self.page().content.print(self.alloc(), "q {d:.2} 0 0 {d:.2} {d:.2} {d:.2} cm /Im{d} Do Q\n", .{ w, h, x, self.height() - y - h, img.index });
+        const c = &self.page().content;
+        const a = self.alloc();
+        try c.appendSlice(a, "q ");
+        if (opts.opacity < 1) try self.setOpacity(opts.opacity);
+        if (opts.rotate == 0) {
+            try c.print(a, "{d:.2} 0 0 {d:.2} {d:.2} {d:.2} cm /Im{d} Do Q\n", .{ w, h, x, self.height() - y - h, img.index });
+        } else {
+            // Move to the center, turn, then place the image around it.
+            const rad = opts.rotate * std.math.pi / 180;
+            const cx = x + w / 2;
+            const cy = self.height() - y - h / 2;
+            try c.print(a, "1 0 0 1 {d:.2} {d:.2} cm {d:.4} {d:.4} {d:.4} {d:.4} 0 0 cm {d:.2} 0 0 {d:.2} {d:.2} {d:.2} cm /Im{d} Do Q\n", .{ cx, cy, @cos(rad), @sin(rad), -@sin(rad), @cos(rad), w, h, -w / 2, -h / 2, img.index });
+        }
     }
 
     /// Makes the rectangle at (x, y) a link to `url`: a click opens it.
@@ -641,6 +699,8 @@ pub const Document = struct {
                 next += 1;
             }
         }
+        const first_gs_id = next;
+        next += self.alphas.items.len;
         const content_ids = try a.alloc(usize, self.pages.items.len);
         const page_ids = try a.alloc(usize, self.pages.items.len);
         const first_link_ids = try a.alloc(usize, self.pages.items.len);
@@ -684,6 +744,12 @@ pub const Document = struct {
             if (id != 0) try writeEmbeddedFont(a, out, offsets, e, id);
         }
 
+        for (self.alphas.items, 0..) |key, i| {
+            const v = @as(f32, @floatFromInt(key)) / 1000;
+            offsets[first_gs_id + i] = out.written().len;
+            try w.print("{d} 0 obj\n<< /Type /ExtGState /ca {d:.3} /CA {d:.3} >>\nendobj\n", .{ first_gs_id + i, v, v });
+        }
+
         for (self.images.items, 0..) |stored, i| {
             const img = stored.encoded;
             offsets[image_ids[i]] = out.written().len;
@@ -724,6 +790,11 @@ pub const Document = struct {
                 for (embedded_ids, 0..) |id, n| {
                     if (id != 0) try w.print(" /E{d} {d} 0 R", .{ n, id });
                 }
+                try w.writeAll(" >>");
+            }
+            if (self.alphas.items.len > 0) {
+                try w.writeAll(" /ExtGState <<");
+                for (0..self.alphas.items.len) |n| try w.print(" /GS{d} {d} 0 R", .{ n, first_gs_id + n });
                 try w.writeAll(" >>");
             }
             if (self.images.items.len > 0) {
@@ -1154,6 +1225,51 @@ test "pages of different sizes keep their own MediaBox" {
     try t.expect(contains(pdf, "/MediaBox [0 0 595.28 841.89]"));
     try t.expect(contains(pdf, "/MediaBox [0 0 841.89 595.28]"));
     try t.expect(contains(pdf, "/Count 2"));
+}
+
+test "opacity: one ExtGState per value, shared, and applied inside q/Q" {
+    var doc = try Document.init(t.allocator, .{ .compress = false });
+    defer doc.deinit();
+    try doc.text(10, 10, "faint", .{ .opacity = 0.2 });
+    try doc.rect(0, 0, 10, 10, .{ .fill = Color.black, .opacity = 0.2 });
+    try doc.line(0, 0, 5, 5, .{ .opacity = 0.5 });
+    try doc.text(10, 30, "solid", .{});
+    const c = doc.pages.items[0].content.items;
+    try t.expect(contains(c, "q /GS0 gs BT /F0"));
+    try t.expect(contains(c, "(faint) Tj ET Q"));
+    try t.expect(contains(c, "q 1.00 w /GS0 gs"));
+    try t.expect(contains(c, "/GS1 gs"));
+    try t.expect(contains(c, "BT /F0 11.00 Tf 0.000 0.000 0.000 rg 10.00 811.89 Td (solid) Tj ET\n"));
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    try t.expectEqual(@as(usize, 2), std.mem.count(u8, pdf, "/Type /ExtGState"));
+    try t.expect(contains(pdf, "/ca 0.200 /CA 0.200"));
+    try t.expect(contains(pdf, "/ExtGState << /GS0 "));
+}
+
+test "rotated text uses a text matrix, aligned along its baseline" {
+    var doc = try Document.init(t.allocator, .{ .compress = false, .size = .{ .width = 100, .height = 100 } });
+    defer doc.deinit();
+    try doc.text(50, 50, "Hi", .{ .size = 10, .rotate = 90 });
+    // Centered at 90°: the 9.44-point line runs upwards, half below (50, 50).
+    try doc.text(50, 50, "Hi", .{ .size = 10, .rotate = 90, .@"align" = .center });
+    const c = doc.pages.items[0].content.items;
+    try t.expect(contains(c, "-0.0000 1.0000 -1.0000 -0.0000 50.00 50.00 Tm (Hi) Tj") or contains(c, "0.0000 1.0000 -1.0000 0.0000 50.00 50.00 Tm (Hi) Tj"));
+    try t.expect(contains(c, "50.00 45.28 Tm (Hi) Tj"));
+}
+
+test "a rotated, translucent image turns around its center" {
+    var doc = try Document.init(t.allocator, .{ .compress = false, .size = .{ .width = 100, .height = 100 } });
+    defer doc.deinit();
+    const rows = [_]u8{ 0, 255, 0, 0, 255 };
+    const png = try testPng(t.allocator, 1, 1, &rows);
+    defer t.allocator.free(png);
+    const img = try doc.addImage(png);
+    try doc.image(img, 10, 10, .{ .width = 20, .height = 10, .rotate = 180, .opacity = 0.5 });
+    const c = doc.pages.items[0].content.items;
+    try t.expect(contains(c, "q /GS0 gs 1 0 0 1 20.00 85.00 cm -1.0000"));
+    try t.expect(contains(c, "20.00 0 0 10.00 -10.00 -5.00 cm /Im0 Do Q"));
 }
 
 test "Color.hex reads #rrggbb" {

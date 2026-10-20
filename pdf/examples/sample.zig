@@ -114,6 +114,11 @@ pub fn main(init: std.process.Init) !void {
         }, .{ .font = font, .header_font = font });
     }
 
+    // A translucent diagonal watermark on the first page, and a turned logo.
+    try doc.setPage(0);
+    try doc.text(doc.width() / 2, doc.height() / 2 + 60, "SAMPLE", .{ .font = .helvetica_bold, .size = 110, .color = accent, .opacity = 0.08, .rotate = 35, .@"align" = .center });
+    try doc.image(logo, doc.width() - 70, 120, .{ .width = 24, .rotate = 30, .opacity = 0.6 });
+
     // Page numbers, once the page count is known.
     const total = doc.pageCount();
     for (0..total) |i| {
