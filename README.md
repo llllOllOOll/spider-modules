@@ -38,6 +38,19 @@ Then `spider migrate` (the modules' migrations run before the app's) and
 `spider check --modules` (or just start the app: it refuses to listen while
 a module is not ready, and says why).
 
+`pdf` is wired the same way (`pdf/src/pdf.zig`, imported as `spider_pdf`);
+it has no migrations, and mounting it is optional.
+
+Add the repository to `build.zig.zon` pinned to a commit, which `zig
+fetch` writes with its hash:
+
+```sh
+zig fetch --save=spider_modules "git+https://github.com/llllOllOOll/spider-modules#<commit>"
+```
+
+While working on a module, `zig build --fork=../spider-modules` in the app
+builds it from a local checkout instead, without touching `build.zig.zon`.
+
 ## Compatibility
 
 Every module states the Spider range it was **tested** with. The

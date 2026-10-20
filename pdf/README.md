@@ -31,8 +31,9 @@ LibreOffice) and no dependency beyond `std`.
   and images: a diagonal translucent watermark is
   `.{ .size = 110, .opacity = 0.08, .rotate = 35, .@"align" = .center }`.
 - **Images**: PNG (gray, RGB, palette, every bit depth from 1 to 16, with
-  transparency kept as a soft mask) and JPEG (embedded as it is). The same image drawn many times is
-  stored once.
+  transparency kept as a soft mask) and JPEG (embedded as it is). The same
+  image added many times (one logo on every page of a batch) is stored
+  once.
 - **Links**, **document properties** (title, author... with accents),
   **page sizes** (A4, A5, Letter, Legal, custom, landscape, mixed in one
   document) and **compressed** page contents.
@@ -140,6 +141,20 @@ try doc.radioGroup("plan", &.{ .{ .value = "basic", .x = 40, .y = 384 }, .{ .val
 try doc.checkbox("agree", 220, 384, 12, .{ .checked = true });
 ```
 
+A barcode or a QR code is a set of rectangles: put them all in one path
+and fill it once (a vector drawing, sharp when printed):
+
+```zig
+var bars = doc.path();
+var x: f32 = 40;
+for (modules) |m| { // from your barcode encoder: { bar: bool, wide: bool }
+    const w: f32 = if (m.wide) 2.7 else 0.9;
+    if (m.bar) try bars.rect(x, 700, w, 36);
+    x += w;
+}
+try doc.drawPath(&bars, .{ .fill = pdf.Color.black });
+```
+
 Page numbers once the page count is known:
 
 ```zig
@@ -192,6 +207,29 @@ target, `importPages`, and remove the target's own pages.
 The module declares a manifest (`pdf` 0.1.0) but has no tables, routes or
 settings: mounting it with `server.mountModules` is optional.
 
+### Testing the documents an app draws
+
+Turn compression off to read what was written, and load the result back
+to check pages and properties:
+
+```zig
+test "the statement repeats the table header on each page" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var doc = try pdf.Document.init(a, .{ .compress = false, .info = .{ .title = "Statement" } });
+    try drawStatement(&doc, sixty_rows); // the app's own drawing code
+    const bytes = try doc.toBytes(a);
+
+    var ed = try pdf.Editor.load(a, bytes);
+    try std.testing.expectEqual(@as(usize, 2), ed.pageCount());
+    try std.testing.expectEqualStrings("Statement", (try ed.properties()).title.?);
+    // Standard fonts write WinAnsi bytes: "Situação" is "Situa\xe7\xe3o".
+    try std.testing.expectEqual(ed.pageCount(), std.mem.count(u8, bytes, "(Situa\xe7\xe3o) Tj"));
+}
+```
+
 ## Limits (for now)
 
 - The standard fonts write WinAnsi characters only (anything else becomes
@@ -229,4 +267,9 @@ zig build pdf-roundtrip   # zig-out/bin/pdf-roundtrip in.pdf out.pdf: load and s
 readers (a browser, Evince/Okular, Acrobat, Preview) after a change.
 
 The design started from the PDF writer of an app in production (bank slips,
-telecom invoices, receipts) and was checked against jsPDF and pdf-lib.
+telecom invoices, receipts) and was checked against jsPDF and pdf-lib. That
+app's documents were then moved onto the module: bank slips and booklets
+(with bank logos, the barcode and a PIX QR code), the telecom invoice,
+receipts, statements and reports came out the same page for page, their
+barcodes and QR codes read by a scanner, at a fifth to a ninth of the
+size.
