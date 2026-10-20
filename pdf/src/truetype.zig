@@ -11,6 +11,10 @@
 //! Composite glyphs (an accented letter built from a letter and an accent)
 //! pull their components into the subset.
 //!
+//! Kerning (the space between pairs like "AV" or "To") comes from the
+//! OpenType GPOS table (pair adjustments, formats 1 and 2, also behind
+//! extension lookups) or the classic `kern` table (format 0).
+//!
 //! Refused with a named error: OpenType fonts with PostScript outlines
 //! (CFF, "OTTO"), font collections (.ttc), and fonts whose license forbids
 //! embedding (`fsType` restricted, or bitmap-only embedding). Every offset
@@ -56,6 +60,11 @@ pub const TrueType = struct {
     cvt: ?Table,
     fpgm: ?Table,
     prep: ?Table,
+    gpos: ?Table = null,
+    kern: ?Table = null,
+    /// The GPOS lookups of the `kern` feature.
+    kern_lookups: [32]u16 = undefined,
+    kern_lookup_count: usize = 0,
     cmap_format: u16,
     cmap_offset: u32,
 
@@ -81,6 +90,8 @@ pub const TrueType = struct {
         var cvt: ?Table = null;
         var fpgm: ?Table = null;
         var prep: ?Table = null;
+        var gpos: ?Table = null;
+        var kern: ?Table = null;
         for (0..num_tables) |i| {
             const rec = 12 + i * 16;
             const tag = try slice(data, rec, 4);
@@ -88,7 +99,7 @@ pub const TrueType = struct {
             const len = try u32At(data, rec + 12);
             if (@as(u64, off) + len > data.len) return Error.InvalidFont;
             const table: Table = .{ .offset = off, .len = len };
-            if (std.mem.eql(u8, tag, "head")) head = table else if (std.mem.eql(u8, tag, "hhea")) hhea = table else if (std.mem.eql(u8, tag, "maxp")) maxp = table else if (std.mem.eql(u8, tag, "hmtx")) hmtx = table else if (std.mem.eql(u8, tag, "loca")) loca = table else if (std.mem.eql(u8, tag, "glyf")) glyf = table else if (std.mem.eql(u8, tag, "cmap")) cmap = table else if (std.mem.eql(u8, tag, "OS/2")) os2 = table else if (std.mem.eql(u8, tag, "post")) post = table else if (std.mem.eql(u8, tag, "name")) name = table else if (std.mem.eql(u8, tag, "cvt ")) cvt = table else if (std.mem.eql(u8, tag, "fpgm")) fpgm = table else if (std.mem.eql(u8, tag, "prep")) prep = table;
+            if (std.mem.eql(u8, tag, "head")) head = table else if (std.mem.eql(u8, tag, "hhea")) hhea = table else if (std.mem.eql(u8, tag, "maxp")) maxp = table else if (std.mem.eql(u8, tag, "hmtx")) hmtx = table else if (std.mem.eql(u8, tag, "loca")) loca = table else if (std.mem.eql(u8, tag, "glyf")) glyf = table else if (std.mem.eql(u8, tag, "cmap")) cmap = table else if (std.mem.eql(u8, tag, "OS/2")) os2 = table else if (std.mem.eql(u8, tag, "post")) post = table else if (std.mem.eql(u8, tag, "name")) name = table else if (std.mem.eql(u8, tag, "cvt ")) cvt = table else if (std.mem.eql(u8, tag, "fpgm")) fpgm = table else if (std.mem.eql(u8, tag, "prep")) prep = table else if (std.mem.eql(u8, tag, "GPOS")) gpos = table else if (std.mem.eql(u8, tag, "kern")) kern = table;
         }
         const h = head orelse return Error.InvalidFont;
         const hh = hhea orelse return Error.InvalidFont;
@@ -116,6 +127,8 @@ pub const TrueType = struct {
             .cvt = cvt,
             .fpgm = fpgm,
             .prep = prep,
+            .gpos = gpos,
+            .kern = kern,
             .cmap_format = 0,
             .cmap_offset = 0,
         };
@@ -142,6 +155,10 @@ pub const TrueType = struct {
             }
         }
         try font.pickCmap(cmap orelse return Error.InvalidFont);
+        // A GPOS table that cannot be read only costs the kerning.
+        font.findKernLookups() catch {
+            font.kern_lookup_count = 0;
+        };
         if (name) |n| font.readPostScriptName(n);
         if (font.name_len == 0) {
             const fallback = "EmbeddedFont";
@@ -165,6 +182,185 @@ pub const TrueType = struct {
             else => 0,
         } catch 0;
         return if (g < self.num_glyphs) g else 0;
+    }
+
+    /// The kerning between two glyphs, in font units (negative brings them
+    /// closer): GPOS first, then the `kern` table; 0 when neither has it.
+    pub fn kerning(self: *const TrueType, left: u16, right: u16) i16 {
+        if (self.kern_lookup_count > 0) {
+            if (self.gposPair(left, right) catch null) |v| return v;
+        }
+        if (self.kern) |k| return self.kernPair(k, left, right) catch 0;
+        return 0;
+    }
+
+    fn findKernLookups(self: *TrueType) Error!void {
+        const g = self.gpos orelse return;
+        const features = g.offset + try u16At(self.data, g.offset + 6);
+        const count = try u16At(self.data, features);
+        for (0..count) |i| {
+            const rec = features + 2 + @as(u32, @intCast(i)) * 6;
+            if (!std.mem.eql(u8, try slice(self.data, rec, 4), "kern")) continue;
+            const feature = features + try u16At(self.data, rec + 4);
+            const n = try u16At(self.data, feature + 2);
+            for (0..n) |j| {
+                const idx = try u16At(self.data, feature + 4 + @as(u32, @intCast(j)) * 2);
+                const seen = std.mem.indexOfScalar(u16, self.kern_lookups[0..self.kern_lookup_count], idx) != null;
+                if (!seen and self.kern_lookup_count < self.kern_lookups.len) {
+                    self.kern_lookups[self.kern_lookup_count] = idx;
+                    self.kern_lookup_count += 1;
+                }
+            }
+        }
+    }
+
+    /// The x advance adjustment of the first glyph of the pair, or null
+    /// when no lookup has the pair.
+    fn gposPair(self: *const TrueType, left: u16, right: u16) Error!?i16 {
+        const g = self.gpos.?;
+        const lookups = g.offset + try u16At(self.data, g.offset + 8);
+        const lookup_count = try u16At(self.data, lookups);
+        for (self.kern_lookups[0..self.kern_lookup_count]) |idx| {
+            if (idx >= lookup_count) continue;
+            const lookup = lookups + try u16At(self.data, lookups + 2 + @as(u32, idx) * 2);
+            const kind = try u16At(self.data, lookup);
+            const subtables = try u16At(self.data, lookup + 4);
+            for (0..subtables) |k| {
+                var sub = lookup + try u16At(self.data, lookup + 6 + @as(u32, @intCast(k)) * 2);
+                if (kind == 9) { // an extension: the real subtable is further
+                    if (try u16At(self.data, sub + 2) != 2) continue;
+                    sub += try u32At(self.data, sub + 4);
+                } else if (kind != 2) continue;
+                if (try self.pairPos(sub, left, right)) |v| return v;
+            }
+        }
+        return null;
+    }
+
+    fn pairPos(self: *const TrueType, sub: u32, left: u16, right: u16) Error!?i16 {
+        const data = self.data;
+        const format = try u16At(data, sub);
+        const cov = (try self.coverage(sub + try u16At(data, sub + 2), left)) orelse return null;
+        const vf1 = try u16At(data, sub + 4);
+        const vf2 = try u16At(data, sub + 6);
+        const size1: u32 = 2 * @popCount(vf1);
+        const size2: u32 = 2 * @popCount(vf2);
+        if (vf1 & 0x0004 == 0) return null; // no x advance
+        const x_at: u32 = 2 * @popCount(vf1 & 0x0003);
+        switch (format) {
+            1 => {
+                const sets = try u16At(data, sub + 8);
+                if (cov >= sets) return null;
+                const set = sub + try u16At(data, sub + 10 + cov * 2);
+                const pairs = try u16At(data, set);
+                const rec_len = 2 + size1 + size2;
+                var lo: u32 = 0;
+                var hi: u32 = pairs;
+                while (lo < hi) {
+                    const mid = (lo + hi) / 2;
+                    const rec = set + 2 + mid * rec_len;
+                    const second = try u16At(data, rec);
+                    if (second == right) return try i16At(data, rec + 2 + x_at);
+                    if (second < right) lo = mid + 1 else hi = mid;
+                }
+                return null;
+            },
+            2 => {
+                const c1 = try self.classOf(sub + try u16At(data, sub + 8), left);
+                const c2 = try self.classOf(sub + try u16At(data, sub + 10), right);
+                const c1_count = try u16At(data, sub + 12);
+                const c2_count = try u16At(data, sub + 14);
+                if (c1 >= c1_count or c2 >= c2_count) return null;
+                const rec = sub + 16 + (@as(u32, c1) * c2_count + c2) * (size1 + size2);
+                return try i16At(data, rec + x_at);
+            },
+            else => return null,
+        }
+    }
+
+    /// The coverage index of a glyph, or null when it is not covered.
+    fn coverage(self: *const TrueType, at: u32, glyph: u16) Error!?u32 {
+        const data = self.data;
+        const format = try u16At(data, at);
+        const count = try u16At(data, at + 2);
+        var lo: u32 = 0;
+        var hi: u32 = count;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (format == 1) {
+                const g = try u16At(data, at + 4 + mid * 2);
+                if (g == glyph) return mid;
+                if (g < glyph) lo = mid + 1 else hi = mid;
+            } else if (format == 2) {
+                const r = at + 4 + mid * 6;
+                const start = try u16At(data, r);
+                const end = try u16At(data, r + 2);
+                if (glyph < start) {
+                    hi = mid;
+                } else if (glyph > end) {
+                    lo = mid + 1;
+                } else return @as(u32, try u16At(data, r + 4)) + (glyph - start);
+            } else return null;
+        }
+        return null;
+    }
+
+    fn classOf(self: *const TrueType, at: u32, glyph: u16) Error!u16 {
+        const data = self.data;
+        switch (try u16At(data, at)) {
+            1 => {
+                const start = try u16At(data, at + 2);
+                const count = try u16At(data, at + 4);
+                if (glyph < start or glyph - start >= count) return 0;
+                return u16At(data, at + 6 + @as(u32, glyph - start) * 2);
+            },
+            2 => {
+                const ranges = try u16At(data, at + 2);
+                var lo: u32 = 0;
+                var hi: u32 = ranges;
+                while (lo < hi) {
+                    const mid = (lo + hi) / 2;
+                    const r = at + 4 + mid * 6;
+                    const start = try u16At(data, r);
+                    const end = try u16At(data, r + 2);
+                    if (glyph < start) {
+                        hi = mid;
+                    } else if (glyph > end) {
+                        lo = mid + 1;
+                    } else return u16At(data, r + 4);
+                }
+                return 0;
+            },
+            else => return 0,
+        }
+    }
+
+    /// The classic `kern` table, format 0 subtables for horizontal text.
+    fn kernPair(self: *const TrueType, k: Table, left: u16, right: u16) Error!i16 {
+        const data = self.data;
+        if (try u16At(data, k.offset) != 0) return 0; // Apple's version 1 layout
+        const tables = try u16At(data, k.offset + 2);
+        var at = k.offset + 4;
+        for (0..tables) |_| {
+            const len = try u16At(data, at + 2);
+            const cov = try u16At(data, at + 4);
+            if (cov >> 8 == 0 and cov & 1 != 0) {
+                const pairs = try u16At(data, at + 6);
+                const key = (@as(u32, left) << 16) | right;
+                var lo: u32 = 0;
+                var hi: u32 = pairs;
+                while (lo < hi) {
+                    const mid = (lo + hi) / 2;
+                    const rec = at + 14 + mid * 6;
+                    const kk = try u32At(data, rec);
+                    if (kk == key) return try i16At(data, rec + 4);
+                    if (kk < key) lo = mid + 1 else hi = mid;
+                }
+            }
+            if (len < 6) break;
+            at += len;
+        }
+        return 0;
     }
 
     /// A glyph's advance width in font units.
@@ -453,7 +649,11 @@ pub const testing = struct {
     /// 1 'A', 2 'B', 3 'Á' (composite: 1 + 4), 4 the acute accent, 5 '?',
     /// 6 the space (no outline), 7 'Ж' (U+0416) and 8 '😀' (U+1F600, through
     /// cmap format 12). 1000 units per em; widths 500 + 50 * glyph.
-    pub fn font(allocator: std.mem.Allocator, opts: struct { fs_type: u16 = 0, version: u32 = 0x00010000, with_format12: bool = true }) ![]u8 {
+    pub const Kerning = enum { none, kern_table, gpos_pairs, gpos_classes };
+
+    /// With `kerning`: A then B is -80 (kern table, or GPOS pair format 1);
+    /// or, by classes (GPOS format 2), B then A is +30.
+    pub fn font(allocator: std.mem.Allocator, opts: struct { fs_type: u16 = 0, version: u32 = 0x00010000, with_format12: bool = true, kerning: Kerning = .none }) ![]u8 {
         const num_glyphs = 9;
         var glyf: std.ArrayList(u8) = .empty;
         defer glyf.deinit(allocator);
@@ -584,8 +784,54 @@ pub const testing = struct {
         try cmap.appendSlice(allocator, f4.items);
         if (opts.with_format12) try cmap.appendSlice(allocator, f12.items);
 
+        var kern_data: std.ArrayList(u8) = .empty;
+        defer kern_data.deinit(allocator);
+        const kern_tag: *const [4]u8 = if (opts.kerning == .kern_table) "kern" else "GPOS";
+        switch (opts.kerning) {
+            .none => {},
+            .kern_table => {
+                for ([_]u16{ 0, 1, 0, 6 + 8 + 6, 0x0001, 1, 6, 0, 0 }) |v| try appendBE(allocator, &kern_data, u16, v);
+                try appendBE(allocator, &kern_data, u16, 1);
+                try appendBE(allocator, &kern_data, u16, 2);
+                try appendBE(allocator, &kern_data, i16, -80);
+            },
+            .gpos_pairs, .gpos_classes => {
+                // Header, an empty script list, one "kern" feature with
+                // lookup 0, a lookup list with one pair adjustment lookup.
+                const k = &kern_data;
+                for ([_]u16{ 1, 0, 10, 12, 26 }) |v| try appendBE(allocator, k, u16, v); // 0..10
+                try appendBE(allocator, k, u16, 0); // 10: ScriptList, no scripts
+                try appendBE(allocator, k, u16, 1); // 12: FeatureList
+                try k.appendSlice(allocator, "kern");
+                try appendBE(allocator, k, u16, 8); // feature at 12+8
+                for ([_]u16{ 0, 1, 0 }) |v| try appendBE(allocator, k, u16, v); // 20: Feature: lookup 0
+                try appendBE(allocator, k, u16, 1); // 26: LookupList
+                try appendBE(allocator, k, u16, 4); // lookup at 26+4
+                for ([_]u16{ 2, 0, 1, 8 }) |v| try appendBE(allocator, k, u16, v); // 30: type 2, subtable at 30+8
+                // 38: the PairPos subtable.
+                if (opts.kerning == .gpos_pairs) {
+                    // Format 1: one pair set at +12, coverage at +18.
+                    for ([_]u16{ 1, 18, 0x0004, 0, 1, 12 }) |v| try appendBE(allocator, k, u16, v);
+                    try appendBE(allocator, k, u16, 1); // +12: one record
+                    try appendBE(allocator, k, u16, 2); // second glyph B
+                    try appendBE(allocator, k, i16, -80);
+                    for ([_]u16{ 1, 1, 1 }) |v| try appendBE(allocator, k, u16, v); // +18..: coverage format 1: [A]
+                } else {
+                    // Format 2 with XPlacement + XAdvance (4 bytes a record).
+                    // +0 header (16), +16 records 2x2x4 = 16, +32 coverage,
+                    // +42 classDef1, +50 classDef2.
+                    for ([_]u16{ 2, 32, 0x0005, 0, 42, 50, 2, 2 }) |v| try appendBE(allocator, k, u16, v);
+                    for ([_]i16{ 0, 0, 0, 0, 0, 0, 7, 30 }) |v| try appendBE(allocator, k, i16, v); // [1][1] = (7, 30)
+                    for ([_]u16{ 2, 1, 1, 2, 0 }) |v| try appendBE(allocator, k, u16, v); // coverage format 2: A..B
+                    for ([_]u16{ 1, 2, 1, 1 }) |v| try appendBE(allocator, k, u16, v); // classDef1 format 1: B is class 1
+                    for ([_]u16{ 2, 1, 1, 1, 1 }) |v| try appendBE(allocator, k, u16, v); // classDef2 format 2: A is class 1
+                }
+            },
+        }
+
         const Entry = struct { tag: *const [4]u8, data: []const u8 };
-        const entries = [_]Entry{
+        const all = [_]Entry{
+            .{ .tag = "GPOS", .data = if (opts.kerning == .gpos_pairs or opts.kerning == .gpos_classes) kern_data.items else "" },
             .{ .tag = "OS/2", .data = &os2 },
             .{ .tag = "cmap", .data = cmap.items },
             .{ .tag = "glyf", .data = glyf.items },
@@ -596,12 +842,25 @@ pub const testing = struct {
             .{ .tag = "maxp", .data = &maxp },
             .{ .tag = "name", .data = name.items },
             .{ .tag = "post", .data = &post },
+            .{ .tag = "kern", .data = if (opts.kerning == .kern_table) kern_data.items else "" },
         };
+        _ = kern_tag;
+        var entries_buf: [all.len]Entry = undefined;
+        var entries_len: usize = 0;
+        for (all) |e| {
+            if (e.data.len == 0) continue;
+            entries_buf[entries_len] = e;
+            entries_len += 1;
+        }
+        const entries = entries_buf[0..entries_len];
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
         try appendBE(allocator, &out, u32, opts.version);
-        try appendBE(allocator, &out, u16, entries.len);
-        for ([_]u16{ 128, 3, entries.len * 16 - 128 }) |v| try appendBE(allocator, &out, u16, v);
+        try appendBE(allocator, &out, u16, @intCast(entries.len));
+        var pow: u16 = 1;
+        var log: u16 = 0;
+        while (pow * 2 <= entries.len) : (log += 1) pow *= 2;
+        for ([_]u16{ pow * 16, log, @as(u16, @intCast(entries.len)) * 16 - pow * 16 }) |v| try appendBE(allocator, &out, u16, v);
         try out.appendNTimes(allocator, 0, entries.len * 16);
         for (entries, 0..) |e, i| {
             const off = out.items.len;
@@ -745,6 +1004,26 @@ test "fonts that cannot be embedded, CFF fonts and broken files are refused" {
     const bytes = try testing.font(t.allocator, .{});
     defer t.allocator.free(bytes);
     try t.expectError(Error.InvalidFont, TrueType.parse(bytes[0 .. bytes.len / 2]));
+}
+
+test "kerning from the kern table and from GPOS pairs and classes" {
+    inline for (.{ testing.Kerning.kern_table, testing.Kerning.gpos_pairs }) |k| {
+        const bytes = try testing.font(t.allocator, .{ .kerning = k });
+        defer t.allocator.free(bytes);
+        const f = try TrueType.parse(bytes);
+        try t.expectEqual(@as(i16, -80), f.kerning(1, 2)); // A B
+        try t.expectEqual(@as(i16, 0), f.kerning(2, 1));
+        try t.expectEqual(@as(i16, 0), f.kerning(1, 1));
+    }
+    const bytes = try testing.font(t.allocator, .{ .kerning = .gpos_classes });
+    defer t.allocator.free(bytes);
+    const f = try TrueType.parse(bytes);
+    try t.expectEqual(@as(i16, 30), f.kerning(2, 1)); // B A, by classes; the x placement before it is skipped
+    try t.expectEqual(@as(i16, 0), f.kerning(1, 2));
+    try t.expectEqual(@as(i16, 0), f.kerning(5, 1)); // '?' is not covered
+    const plain = try testing.font(t.allocator, .{});
+    defer t.allocator.free(plain);
+    try t.expectEqual(@as(i16, 0), (try TrueType.parse(plain)).kerning(1, 2));
 }
 
 test "checksum pads the last word with zeros" {

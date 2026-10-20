@@ -11,7 +11,8 @@ LibreOffice) and no dependency beyond `std`.
 - **Embedded TrueType fonts** (`addFont`): any .ttf, any script the font
   covers (Cyrillic, Greek, Central European, Vietnamese, emoji...). Only the
   glyphs drawn are embedded (a 600 KB font adds about 25 KB), with a
-  Unicode map so text can be copied, searched and extracted.
+  Unicode map so text can be copied, searched and extracted, and the
+  font's kerning (GPOS or `kern`) applied, in measuring and wrapping too.
 - **Wrapped text**: `textBox` (in a box, left, centered or right) and
   `paragraph` (between the margins, flowing over pages line by line).
 - **Tables** that flow over pages: cells wrap, rows grow to their tallest
@@ -153,8 +154,9 @@ settings: mounting it with `server.mountModules` is optional.
   `?`); use an embedded font for the rest. A character an embedded font
   lacks is written as its `?`.
 - Embedded fonts: TrueType outlines only (no CFF `.otf`, no `.ttc`
-  collections); no kerning, ligatures or complex shaping (Arabic, Indic
-  scripts need a shaper); text runs left to right.
+  collections); kerning yes, but no ligatures or complex shaping (Arabic,
+  Indic scripts need a shaper); text runs left to right. The standard
+  fonts are not kerned.
 - PNG with 16 bits per channel and interlaced PNG are refused by name;
   images over 10,000 pixels on a side too.
 - Editing: an encrypted file that needs a password fails with

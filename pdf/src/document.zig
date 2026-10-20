@@ -338,11 +338,18 @@ pub const Document = struct {
 
     /// The width of `str` (UTF-8) in points.
     pub fn textWidth(self: *Document, str: []const u8, font: Font, size: f32) f32 {
-        var units: u32 = 0;
+        var units: i32 = 0;
         var i: usize = 0;
+        var prev: ?u16 = null;
+        const tt: ?*const truetype.TrueType = if (font.standard() == null) &self.embedded.items[font.embedded].tt else null;
         while (i < str.len) {
             const cp = nextCodepoint(str, &i);
-            units += self.encodeChar(font, cp).width;
+            const e = self.encodeChar(font, cp);
+            units += e.width;
+            if (tt) |f| {
+                if (prev) |p| units += self.kern(f, p, e.code, cp);
+            }
+            prev = e.code;
         }
         return @as(f32, @floatFromInt(units)) / 1000.0 * size;
     }
@@ -391,15 +398,25 @@ pub const Document = struct {
             for (run.codes[ln.start..ln.end], bytes) |code, *b| b.* = @intCast(code);
             try writeLiteral(a, c, bytes);
         } else {
-            // Two bytes per glyph number (Identity-H), in hex.
+            // Two bytes per glyph number (Identity-H), in hex; with kerning,
+            // a TJ array whose numbers move the next glyph (positive: left).
             const e = &self.embedded.items[opts.font.embedded];
+            const kerned = run.kerns.len > 0 and ln.end > ln.start and
+                std.mem.indexOfNone(i16, run.kerns[ln.start .. ln.end - 1], &.{0}) != null;
+            if (kerned) try c.append(a, '[');
             try c.append(a, '<');
-            for (run.codes[ln.start..ln.end], run.cps[ln.start..ln.end]) |gid, cp| {
+            for (ln.start..ln.end) |i| {
+                const gid = run.codes[i];
                 e.used[gid] = true;
-                if (e.unicode[gid] == 0) e.unicode[gid] = cp;
+                if (e.unicode[gid] == 0) e.unicode[gid] = run.cps[i];
                 try c.print(a, "{X:0>4}", .{gid});
+                if (kerned and i + 1 < ln.end and run.kerns[i] != 0) try c.print(a, "> {d} <", .{-@as(i32, run.kerns[i])});
             }
             try c.append(a, '>');
+            if (kerned) {
+                try c.appendSlice(a, if (translucent) "] TJ ET Q\n" else "] TJ ET\n");
+                return;
+            }
         }
         try c.appendSlice(a, if (translucent) " Tj ET Q\n" else " Tj ET\n");
     }
@@ -506,7 +523,24 @@ pub const Document = struct {
             try widths.append(a, e.width);
             try cps.append(a, cp);
         }
-        return .{ .codes = codes.items, .widths = widths.items, .cps = cps.items };
+        var kerns: []i16 = &.{};
+        if (font.standard() == null and codes.items.len > 1) {
+            const tt = &self.embedded.items[font.embedded].tt;
+            if (tt.kern_lookup_count > 0 or tt.kern != null) {
+                kerns = try a.alloc(i16, codes.items.len);
+                kerns[kerns.len - 1] = 0;
+                for (0..codes.items.len - 1) |k| kerns[k] = self.kern(tt, codes.items[k], codes.items[k + 1], cps.items[k + 1]);
+            }
+        }
+        return .{ .codes = codes.items, .widths = widths.items, .cps = cps.items, .kerns = kerns };
+    }
+
+    /// The kerning between two glyphs in thousandths of the size; none
+    /// across a line break.
+    fn kern(self: *Document, tt: *const truetype.TrueType, left: u16, right: u16, right_cp: u21) i16 {
+        _ = self;
+        if (right_cp == '\n') return 0;
+        return @intCast(std.math.clamp(tt.scale(tt.kerning(left, right)), -1000, 1000));
     }
 
     // ── Shapes ──────────────────────────────────────────────────────────
@@ -1410,6 +1444,26 @@ test "standard and embedded fonts in one document, and in a table" {
     try expectValidXref(pdf);
     try t.expect(contains(pdf, "/Font << /F0 "));
     try t.expect(contains(pdf, " /E0 "));
+}
+
+test "kerning from an embedded font: TJ adjustments, in widths and wrapping" {
+    const font_bytes = try truetype.testing.font(t.allocator, .{ .kerning = .gpos_pairs });
+    defer t.allocator.free(font_bytes);
+    var doc = try Document.init(t.allocator, .{ .compress = false });
+    defer doc.deinit();
+    const f = try doc.addFont(font_bytes);
+    try doc.text(10, 20, "ABBA", .{ .font = f, .size = 10 });
+    try doc.text(10, 40, "BB", .{ .font = f, .size = 10 });
+    const c = doc.pages.items[0].content.items;
+    // A then B is -80: the B moves 80 thousandths left.
+    try t.expect(contains(c, "[<0001> 80 <000200020001>] TJ"));
+    try t.expect(contains(c, "<00020002> Tj")); // nothing to kern: a plain Tj
+    // "AB": 550 + 600 - 80 thousandths at 10 points.
+    try t.expectApproxEqAbs(@as(f32, 10.7), doc.textWidth("AB", f, 10), 0.001);
+    try t.expectApproxEqAbs(@as(f32, 11.5), doc.textWidth("BA", f, 10), 0.001);
+    // Right alignment uses the kerned width.
+    try doc.text(100, 60, "AB", .{ .font = f, .size = 10, .@"align" = .right });
+    try t.expect(contains(doc.pages.items[0].content.items, "89.30 "));
 }
 
 test "addFont refuses what it cannot embed" {

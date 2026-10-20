@@ -17,11 +17,18 @@ pub const Run = struct {
     widths: []const u16,
     /// The characters themselves.
     cps: []const u21,
+    /// Kerning after each character (before the next one), in thousandths
+    /// of the font size; empty when the font has none.
+    kerns: []const i16 = &.{},
 
-    /// The width of `codes[start..end]` in points at `size`.
+    /// The width of `codes[start..end]` in points at `size`, with the
+    /// kerning between its characters.
     pub fn width(self: Run, start: usize, end: usize, size: f32) f32 {
-        var units: u32 = 0;
+        var units: i32 = 0;
         for (self.widths[start..end]) |w| units += w;
+        if (self.kerns.len > 0 and end > start) {
+            for (self.kerns[start .. end - 1]) |k| units += k;
+        }
         return @as(f32, @floatFromInt(units)) / 1000.0 * size;
     }
 };
@@ -151,6 +158,12 @@ test "repeated spaces at a break do not start the next line" {
 
 test "empty text has no lines" {
     try expectLines(&.{}, "", 100);
+}
+
+test "kerning counts in a line's width, but not after its last character" {
+    const run: Run = .{ .codes = &.{ 1, 2, 3 }, .widths = &.{ 500, 500, 500 }, .cps = &.{ 'A', 'V', 'A' }, .kerns = &.{ -100, -50, -999 } };
+    try t.expectApproxEqAbs(@as(f32, 13.5), run.width(0, 3, 10), 0.001); // (1500 - 150) thousandths of 10
+    try t.expectApproxEqAbs(@as(f32, 5), run.width(2, 3, 10), 0.001);
 }
 
 test "a line is never wider than the box" {

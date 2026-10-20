@@ -103,6 +103,7 @@ pub fn main(init: std.process.Init) !void {
         try doc.paragraph("Ελληνικά: Ξεσκεπάζω την ψυχοφθόρα βδελυγμία.", .{ .font = font });
         try doc.paragraph("Polski: Zażółć gęślą jaźń. Türkçe: Pijamalı hasta yağız şoföre çabucak güvendi.", .{ .font = font });
         try doc.paragraph("Português: Não há ação sem coração — “aspas”, € e º.", .{ .font = font });
+        try doc.paragraph("Kerning: AVATAR WAVY Toyota Yawn LT P. VA", .{ .font = font, .size = 22 });
         doc.moveDown(10);
         try doc.table(&.{
             .{ .header = "Город", .width = 200 },
