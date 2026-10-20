@@ -1357,6 +1357,39 @@ test "permissions are reported" {
     try t.expect(plain.allows(.modify));
 }
 
+test "fields made by Document are read and filled by Editor" {
+    var doc = try document.Document.init(t.allocator, .{ .size = .{ .width = 300, .height = 300 } });
+    defer doc.deinit();
+    try doc.textField("customer.name", 10, 10, 200, 20, .{ .value = "Maria" });
+    try doc.checkbox("agree", 10, 40, 12, .{});
+    try doc.radioGroup("plan", &.{ .{ .value = "basic", .x = 10, .y = 60 }, .{ .value = "pro", .x = 40, .y = 60 } }, 12, .{ .selected = "basic" });
+    try doc.dropdown("city", 10, 80, 120, 20, &.{ "Goiânia", "Brasília" }, .{});
+    const bytes = try doc.toBytes(t.allocator);
+    defer t.allocator.free(bytes);
+
+    var ed = try Editor.load(t.allocator, bytes);
+    defer ed.deinit();
+    const list = try ed.fields();
+    try t.expectEqual(@as(usize, 4), list.len);
+    try t.expectEqualStrings("customer.name", list[0].name);
+    try t.expectEqual(FieldKind.text, list[0].kind);
+    try t.expectEqualStrings("Maria", list[0].value.?);
+    try t.expectEqual(FieldKind.checkbox, list[1].kind);
+    try t.expectEqualStrings("Off", list[1].value.?);
+    try t.expectEqual(FieldKind.radio, list[2].kind);
+    try t.expectEqualStrings("basic", list[2].value.?);
+    try t.expectEqual(FieldKind.choice, list[3].kind);
+    try t.expectEqualStrings("Goiânia", list[3].value.?);
+
+    try ed.setText("customer.name", "Maria José");
+    try ed.setCheckbox("agree", true);
+    var again = try roundTrip(&ed);
+    defer again.deinit();
+    const after = try again.fields();
+    try t.expectEqualStrings("Maria José", after[0].value.?);
+    try t.expectEqualStrings("Yes", after[1].value.?);
+}
+
 test "parseDa reads the font, the size and the color operators" {
     const d = parseDa("/Helv 12 Tf 0 0 1 rg");
     try t.expectEqualStrings("Helv", d.font.?);

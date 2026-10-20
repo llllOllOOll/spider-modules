@@ -19,6 +19,14 @@ LibreOffice) and no dependency beyond `std`.
   cell, the header repeats on each page, optional stripes and grid.
 - **Shapes**: lines (dashed), rectangles (filled, outlined, rounded),
   ellipses and circles.
+- **Paths**: lines, cubic and quadratic Bezier curves, polygons, holes
+  (even-odd); **gradients** (linear and radial, any number of color
+  stops); **clipping** to any path (a round photo).
+- **Bookmarks** (the outline panel, nested) and **links to pages** of the
+  document.
+- **Form fields**: text boxes (single or multiline), checkboxes, radio
+  groups and drop-down lists, drawn already filled, ready for people to
+  fill in (and readable by `Editor`).
 - **Opacity** on text, shapes, lines and images, and **rotation** of text
   and images: a diagonal translucent watermark is
   `.{ .size = 110, .opacity = 0.08, .rotate = 35, .@"align" = .center }`.
@@ -95,6 +103,42 @@ The font's bytes must outlive the document (`@embedFile`, or freed after
 `toBytes`). An `.otf` with PostScript outlines (CFF) is refused with
 `error.UnsupportedFont`, a font whose license forbids embedding with
 `error.FontNotEmbeddable`.
+
+Shapes, gradients and clipping:
+
+```zig
+var heart = doc.path();
+try heart.moveTo(220, 205);
+try heart.curveTo(160, 165, 185, 120, 220, 150);
+try heart.curveTo(255, 120, 280, 165, 220, 205);
+try heart.close();
+try doc.drawPath(&heart, .{ .fill = pdf.Color.hex("#e11d48") });
+
+try doc.rect(40, 40, 515, 60, .{ .radius = 10, .gradient = pdf.Gradient.linear(40, 0, 555, 0, &.{
+    .{ .offset = 0, .color = pdf.Color.hex("#1e3a8a") },
+    .{ .offset = 1, .color = pdf.Color.hex("#38bdf8") },
+}) });
+
+try doc.saveState(); // a round photo
+var round = doc.path();
+try round.ellipse(455, 170, 38, 38);
+try doc.clip(&round, .{});
+try doc.image(photo, 400, 120, .{ .height = 100 });
+try doc.restoreState();
+```
+
+Bookmarks, links inside the document, and a form:
+
+```zig
+const ch1 = try doc.addBookmark("1. Contract", .{}); // current page and cursor
+_ = try doc.addBookmark("1.1 Parties", .{ .parent = ch1, .page = 0, .y = 300 });
+try doc.linkToPage(40, 430, 120, 12, 0, .{}); // a click goes to page 1
+
+try doc.textField("customer.name", 40, 256, 250, 22, .{ .value = "José" });
+try doc.dropdown("customer.city", 310, 256, 160, 22, &.{ "Goiânia", "Brasília" }, .{});
+try doc.radioGroup("plan", &.{ .{ .value = "basic", .x = 40, .y = 384 }, .{ .value = "pro", .x = 120, .y = 384 } }, 12, .{ .selected = "pro" });
+try doc.checkbox("agree", 220, 384, 12, .{ .checked = true });
+```
 
 Page numbers once the page count is known:
 

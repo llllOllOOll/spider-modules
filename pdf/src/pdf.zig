@@ -7,6 +7,8 @@
 //! the glyphs used are embedded), text wrapped in boxes and paragraphs
 //! that flow over pages,
 //! tables with repeated headers, lines, rectangles (rounded), ellipses,
+//! free paths with curves, gradients and clipping, bookmarks and links to
+//! pages, form fields (text, checkbox, radio, drop-down),
 //! PNG (with transparency) and JPEG images, links, document properties,
 //! and compressed output. Coordinates are points from the top-left corner.
 //!
@@ -51,6 +53,16 @@ pub const LineOptions = document.LineOptions;
 pub const ShapeOptions = document.ShapeOptions;
 pub const ImageOptions = document.ImageOptions;
 pub const Image = document.Image;
+pub const Path = document.Path;
+pub const Gradient = document.Gradient;
+pub const GradientStop = document.GradientStop;
+pub const Bookmark = document.Bookmark;
+pub const BookmarkOptions = document.BookmarkOptions;
+pub const TextFieldOptions = document.TextFieldOptions;
+pub const CheckboxOptions = document.CheckboxOptions;
+pub const RadioChoice = document.RadioChoice;
+pub const RadioOptions = document.RadioOptions;
+pub const DropdownOptions = document.DropdownOptions;
 pub const Column = document.Column;
 pub const TableOptions = document.TableOptions;
 pub const Error = document.Error;
@@ -108,6 +120,7 @@ test {
     _ = @import("reader.zig");
     _ = @import("editor.zig");
     _ = @import("crypt.zig");
+    _ = @import("forms.zig");
 }
 
 test "the module manifest is pdf 0.1.0" {

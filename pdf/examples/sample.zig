@@ -92,6 +92,64 @@ pub fn main(init: std.process.Init) !void {
     try doc.text(40, 60, "A landscape page", .{ .font = .helvetica_bold, .size = 18 });
     _ = try doc.textBox(40, 80, 300, "Centered text in a box of 300 points, wrapped over several lines as needed by its length.", .{ .@"align" = .center });
 
+    // Drawing and a form, on a page of their own.
+    try doc.addPage();
+    _ = try doc.addBookmark("Drawing and forms", .{ .y = 40 });
+    const band = [_]pdf.GradientStop{
+        .{ .offset = 0, .color = pdf.Color.hex("#1e3a8a") },
+        .{ .offset = 0.6, .color = pdf.Color.hex("#38bdf8") },
+        .{ .offset = 1, .color = pdf.Color.hex("#f0f9ff") },
+    };
+    try doc.rect(40, 40, doc.contentWidth(), 60, .{ .gradient = pdf.Gradient.linear(40, 0, 40 + doc.contentWidth(), 0, &band), .radius = 10 });
+    try doc.text(56, 78, "Paths, gradients, clipping and forms", .{ .font = .helvetica_bold, .size = 16, .color = pdf.Color.white });
+
+    // A five-pointed star, a heart of curves, a ring with a hole.
+    var star: [10][2]f32 = undefined;
+    for (&star, 0..) |*pt, i| {
+        const angle = @as(f32, @floatFromInt(i)) * std.math.pi / 5.0 - std.math.pi / 2.0;
+        const r: f32 = if (i % 2 == 0) 40 else 16;
+        pt.* = .{ 100 + r * @cos(angle), 170 + r * @sin(angle) };
+    }
+    try doc.polygon(&star, .{ .gradient = pdf.Gradient.radial(100, 170, 40, &.{ .{ .offset = 0, .color = pdf.Color.hex("#fde68a") }, .{ .offset = 1, .color = pdf.Color.hex("#f59e0b") } }), .stroke = pdf.Color.hex("#b45309") });
+    var heart = doc.path();
+    try heart.moveTo(220, 205);
+    try heart.curveTo(160, 165, 185, 120, 220, 150);
+    try heart.curveTo(255, 120, 280, 165, 220, 205);
+    try heart.close();
+    try doc.drawPath(&heart, .{ .fill = pdf.Color.hex("#e11d48") });
+    var ring = doc.path();
+    try ring.ellipse(330, 170, 38, 38);
+    try ring.ellipse(330, 170, 20, 20);
+    try doc.drawPath(&ring, .{ .fill = pdf.Color.hex("#16a34a"), .even_odd = true });
+
+    // The photo, clipped to a circle.
+    try doc.saveState();
+    var round = doc.path();
+    try round.ellipse(455, 170, 38, 38);
+    try doc.clip(&round, .{});
+    try doc.image(photo, 400, 120, .{ .height = 100 });
+    try doc.restoreState();
+    try doc.circle(455, 170, 38, .{ .stroke = pdf.Color.light_gray, .line_width = 2 });
+
+    // A form, filled already, that people can change.
+    _ = try doc.addBookmark("Form", .{ .y = 240 });
+    try doc.text(40, 250, "Name", .{ .size = 9, .color = pdf.Color.gray });
+    try doc.textField("customer.name", 40, 256, 250, 22, .{ .value = "José da Conceição" });
+    try doc.text(310, 250, "City", .{ .size = 9, .color = pdf.Color.gray });
+    try doc.dropdown("customer.city", 310, 256, 160, 22, &.{ "Goiânia", "Brasília", "São Paulo" }, .{ .value = "Goiânia" });
+    try doc.text(40, 300, "Notes", .{ .size = 9, .color = pdf.Color.gray });
+    try doc.textField("notes", 40, 306, 430, 60, .{ .multiline = true, .value = "Multiline fields wrap their text, and a reader lets people type more of it." });
+    try doc.radioGroup("plan", &.{ .{ .value = "basic", .x = 40, .y = 384 }, .{ .value = "pro", .x = 120, .y = 384 } }, 12, .{ .selected = "pro" });
+    try doc.text(56, 394, "Basic", .{ .size = 10 });
+    try doc.text(136, 394, "Pro", .{ .size = 10 });
+    try doc.checkbox("agree", 220, 384, 12, .{ .checked = true });
+    try doc.text(236, 394, "I agree with the terms", .{ .size = 10 });
+
+    // A link back to the first page, and bookmarks for the others.
+    try doc.text(40, 440, "Back to the invoice", .{ .size = 10, .color = accent });
+    try doc.linkToPage(40, 430, doc.textWidth("Back to the invoice", .helvetica, 10), 12, 0, .{});
+    _ = try doc.addBookmark("Invoice", .{ .page = 0, .y = 40 });
+
     // An embedded TrueType font, when one is given.
     if (args.len >= 3) {
         const font_bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, args[2], init.arena.allocator(), .limited(32 << 20));

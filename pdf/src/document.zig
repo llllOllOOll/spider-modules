@@ -24,6 +24,7 @@ const text_mod = @import("text.zig");
 const truetype = @import("truetype.zig");
 const codec = @import("image.zig");
 const table_mod = @import("table.zig");
+const forms = @import("forms.zig");
 
 /// A font to write with: one of the standard fonts every PDF reader has
 /// (`.helvetica`, `.courier_bold`...), or a TrueType font added with
@@ -50,6 +51,11 @@ pub const Font = union(enum) {
 };
 pub const Column = table_mod.Column;
 pub const TableOptions = table_mod.TableOptions;
+pub const TextFieldOptions = forms.TextFieldOptions;
+pub const CheckboxOptions = forms.CheckboxOptions;
+pub const RadioChoice = forms.RadioChoice;
+pub const RadioOptions = forms.RadioOptions;
+pub const DropdownOptions = forms.DropdownOptions;
 
 /// A page size in points.
 pub const Size = struct {
@@ -148,6 +154,108 @@ pub const ShapeOptions = struct {
     radius: f32 = 0,
     /// 1 is opaque, 0 invisible; applies to the fill and the outline.
     opacity: f32 = 1,
+    /// Fills with a gradient instead of a color (`fill` is ignored).
+    gradient: ?Gradient = null,
+    /// Dash and gap lengths of the outline.
+    dash: ?[2]f32 = null,
+    /// The even-odd rule: an inner shape drawn inside an outer one is a
+    /// hole (a ring, a frame).
+    even_odd: bool = false,
+};
+
+pub const GradientStop = struct {
+    /// From 0 (the start) to 1 (the end), increasing.
+    offset: f32,
+    color: Color,
+};
+
+/// A color gradient: linear (from one point to another) or radial (from
+/// one circle to another). Points in page coordinates (top-left).
+pub const Gradient = struct {
+    kind: enum { linear, radial } = .linear,
+    from: [2]f32,
+    to: [2]f32,
+    from_radius: f32 = 0,
+    to_radius: f32 = 0,
+    stops: []const GradientStop,
+
+    /// From (x0, y0) to (x1, y1).
+    pub fn linear(x0: f32, y0: f32, x1: f32, y1: f32, stops: []const GradientStop) Gradient {
+        return .{ .from = .{ x0, y0 }, .to = .{ x1, y1 }, .stops = stops };
+    }
+
+    /// From the center (cx, cy) out to radius `r`.
+    pub fn radial(cx: f32, cy: f32, r: f32, stops: []const GradientStop) Gradient {
+        return .{ .kind = .radial, .from = .{ cx, cy }, .to = .{ cx, cy }, .to_radius = r, .stops = stops };
+    }
+};
+
+/// A shape of lines and curves, built with its methods and drawn with
+/// `Document.drawPath` or used with `Document.clip`. Coordinates from the
+/// top-left corner of the page.
+pub const Path = struct {
+    allocator: std.mem.Allocator,
+    segments: std.ArrayList(Segment) = .empty,
+    current: [2]f32 = .{ 0, 0 },
+    start: [2]f32 = .{ 0, 0 },
+
+    const Segment = union(enum) {
+        move: [2]f32,
+        line: [2]f32,
+        curve: [6]f32,
+        rect: [4]f32,
+        close,
+    };
+
+    /// Starts a new piece of the path at (x, y).
+    pub fn moveTo(self: *Path, x: f32, y: f32) !void {
+        try self.segments.append(self.allocator, .{ .move = .{ x, y } });
+        self.current = .{ x, y };
+        self.start = .{ x, y };
+    }
+
+    /// A straight line to (x, y).
+    pub fn lineTo(self: *Path, x: f32, y: f32) !void {
+        try self.segments.append(self.allocator, .{ .line = .{ x, y } });
+        self.current = .{ x, y };
+    }
+
+    /// A cubic Bezier curve to (x, y), pulled by two control points.
+    pub fn curveTo(self: *Path, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) !void {
+        try self.segments.append(self.allocator, .{ .curve = .{ x1, y1, x2, y2, x, y } });
+        self.current = .{ x, y };
+    }
+
+    /// A quadratic Bezier curve to (x, y) with one control point (written
+    /// as the equivalent cubic one).
+    pub fn quadTo(self: *Path, cx: f32, cy: f32, x: f32, y: f32) !void {
+        const p0 = self.current;
+        try self.curveTo(p0[0] + 2.0 / 3.0 * (cx - p0[0]), p0[1] + 2.0 / 3.0 * (cy - p0[1]), x + 2.0 / 3.0 * (cx - x), y + 2.0 / 3.0 * (cy - y), x, y);
+    }
+
+    /// A rectangle as its own closed piece.
+    pub fn rect(self: *Path, x: f32, y: f32, w: f32, h: f32) !void {
+        try self.segments.append(self.allocator, .{ .rect = .{ x, y, w, h } });
+        self.current = .{ x, y };
+        self.start = .{ x, y };
+    }
+
+    /// An ellipse as its own closed piece.
+    pub fn ellipse(self: *Path, cx: f32, cy: f32, rx: f32, ry: f32) !void {
+        const k: f32 = 0.5522848;
+        try self.moveTo(cx + rx, cy);
+        try self.curveTo(cx + rx, cy - ry * k, cx + rx * k, cy - ry, cx, cy - ry);
+        try self.curveTo(cx - rx * k, cy - ry, cx - rx, cy - ry * k, cx - rx, cy);
+        try self.curveTo(cx - rx, cy + ry * k, cx - rx * k, cy + ry, cx, cy + ry);
+        try self.curveTo(cx + rx * k, cy + ry, cx + rx, cy + ry * k, cx + rx, cy);
+        try self.close();
+    }
+
+    /// Closes the current piece with a line back to its start.
+    pub fn close(self: *Path) !void {
+        try self.segments.append(self.allocator, .close);
+        self.current = self.start;
+    }
 };
 
 pub const ImageOptions = struct {
@@ -178,14 +286,60 @@ pub const Error = error{
     InvalidUrl,
     /// An image that does not belong to this document.
     UnknownImage,
+    /// A link or bookmark to a page that the document does not have when
+    /// it is written.
+    NoSuchTarget,
+    /// A bookmark parent that does not belong to this document.
+    UnknownBookmark,
+    /// Two form fields with the same name.
+    DuplicateField,
+    /// `restoreState` without a `saveState` before it.
+    UnbalancedState,
+    /// A gradient with fewer than two stops, or stops out of order or
+    /// outside 0..1.
+    InvalidGradient,
+    /// A radio group without choices, a drop-down without options, or a
+    /// selected value that is not among them.
+    InvalidField,
 };
 
-const Link = struct { rect: [4]f32, url: []const u8 };
+/// Something clickable on a page: a link out, a link to a page of the
+/// document, or a form field's box (forms.zig).
+pub const Annot = union(enum) {
+    uri: struct { rect: [4]f32, url: []const u8 },
+    goto: struct { rect: [4]f32, page: usize, top: ?f32 },
+    widget: struct { field: u32, kid: u32 },
+};
 
 const Page = struct {
     size: Size,
     content: std.ArrayList(u8) = .empty,
-    links: std.ArrayList(Link) = .empty,
+    annots: std.ArrayList(Annot) = .empty,
+    /// saveState calls not restored yet.
+    depth: usize = 0,
+};
+
+/// An entry of the document's outline (the bookmarks panel of readers).
+pub const Bookmark = struct { index: u32 };
+
+pub const BookmarkOptions = struct {
+    /// Nests the bookmark under another one.
+    parent: ?Bookmark = null,
+    /// The page it opens (from 0); null: the current page.
+    page: ?usize = null,
+    /// The height it scrolls to, from the top of the page; null: the
+    /// cursor (`doc.y`).
+    y: ?f32 = null,
+    /// Show its children when the document opens.
+    open: bool = true,
+};
+
+const Outline = struct {
+    title: []const u8,
+    page: usize,
+    y: f32,
+    parent: ?u32,
+    open: bool,
 };
 
 const EmbeddedFont = struct {
@@ -217,6 +371,9 @@ pub const Document = struct {
     embedded: std.ArrayList(EmbeddedFont) = .empty,
     /// Opacities in use, in thousandths: ExtGState /GS{index}.
     alphas: std.ArrayList(u16) = .empty,
+    outlines: std.ArrayList(Outline) = .empty,
+    fields: std.ArrayList(forms.Field) = .empty,
+    shadings: std.ArrayList(Gradient) = .empty,
     /// The flowing cursor: where the next `paragraph` or `table` starts,
     /// in points from the top of the current page.
     y: f32 = 0,
@@ -558,45 +715,32 @@ pub const Document = struct {
     /// A rectangle with its top-left corner at (x, y), filled, outlined or
     /// both, with rounded corners when `opts.radius` is set.
     pub fn rect(self: *Document, x: f32, y: f32, w: f32, h: f32, opts: ShapeOptions) !void {
-        try self.beginShape(opts);
-        const c = &self.page().content;
-        const bottom_y = self.height() - y - h;
+        var p = self.path();
         const r = @min(opts.radius, @min(w, h) / 2);
         if (r <= 0) {
-            try c.print(self.alloc(), "{d:.2} {d:.2} {d:.2} {d:.2} re ", .{ x, bottom_y, w, h });
+            try p.rect(x, y, w, h);
         } else {
             // Four sides joined by quarter circles (Bezier, kappa ≈ 0.5523).
             const k = r * kappa;
-            const x2 = x + w;
-            const y2 = bottom_y + h;
-            const a = self.alloc();
-            try c.print(a, "{d:.2} {d:.2} m ", .{ x + r, bottom_y });
-            try c.print(a, "{d:.2} {d:.2} l ", .{ x2 - r, bottom_y });
-            try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c ", .{ x2 - r + k, bottom_y, x2, bottom_y + r - k, x2, bottom_y + r });
-            try c.print(a, "{d:.2} {d:.2} l ", .{ x2, y2 - r });
-            try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c ", .{ x2, y2 - r + k, x2 - r + k, y2, x2 - r, y2 });
-            try c.print(a, "{d:.2} {d:.2} l ", .{ x + r, y2 });
-            try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c ", .{ x + r - k, y2, x, y2 - r + k, x, y2 - r });
-            try c.print(a, "{d:.2} {d:.2} l ", .{ x, bottom_y + r });
-            try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c h ", .{ x, bottom_y + r - k, x + r - k, bottom_y, x + r, bottom_y });
+            try p.moveTo(x + r, y);
+            try p.lineTo(x + w - r, y);
+            try p.curveTo(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+            try p.lineTo(x + w, y + h - r);
+            try p.curveTo(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+            try p.lineTo(x + r, y + h);
+            try p.curveTo(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+            try p.lineTo(x, y + r);
+            try p.curveTo(x, y + r - k, x + r - k, y, x + r, y);
+            try p.close();
         }
-        try self.endShape(opts);
+        try self.drawPath(&p, opts);
     }
 
     /// An ellipse centered on (cx, cy).
     pub fn ellipse(self: *Document, cx: f32, cy: f32, rx: f32, ry: f32, opts: ShapeOptions) !void {
-        try self.beginShape(opts);
-        const c = &self.page().content;
-        const a = self.alloc();
-        const y = self.height() - cy;
-        const kx = rx * kappa;
-        const ky = ry * kappa;
-        try c.print(a, "{d:.2} {d:.2} m ", .{ cx + rx, y });
-        try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c ", .{ cx + rx, y + ky, cx + kx, y + ry, cx, y + ry });
-        try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c ", .{ cx - kx, y + ry, cx - rx, y + ky, cx - rx, y });
-        try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c ", .{ cx - rx, y - ky, cx - kx, y - ry, cx, y - ry });
-        try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c h ", .{ cx + kx, y - ry, cx + rx, y - ky, cx + rx, y });
-        try self.endShape(opts);
+        var p = self.path();
+        try p.ellipse(cx, cy, rx, ry);
+        try self.drawPath(&p, opts);
     }
 
     /// A circle centered on (cx, cy).
@@ -604,19 +748,133 @@ pub const Document = struct {
         return self.ellipse(cx, cy, r, r, opts);
     }
 
-    const kappa: f32 = 0.5522848;
-
-    fn beginShape(self: *Document, opts: ShapeOptions) !void {
-        const c = &self.page().content;
-        try c.print(self.alloc(), "q {d:.2} w ", .{opts.line_width});
-        if (opts.opacity < 1) try self.setOpacity(opts.opacity);
-        if (opts.fill) |f| try self.color(f, "rg");
-        try self.color(opts.stroke orelse Color.black, "RG");
+    /// A closed shape through `points` (at least three).
+    pub fn polygon(self: *Document, points: []const [2]f32, opts: ShapeOptions) !void {
+        if (points.len < 2) return;
+        var p = self.path();
+        try p.moveTo(points[0][0], points[0][1]);
+        for (points[1..]) |pt| try p.lineTo(pt[0], pt[1]);
+        try p.close();
+        try self.drawPath(&p, opts);
     }
 
-    fn endShape(self: *Document, opts: ShapeOptions) !void {
-        const op: []const u8 = if (opts.fill != null and opts.stroke != null) "B" else if (opts.fill != null) "f" else "S";
-        try self.page().content.print(self.alloc(), "{s} Q\n", .{op});
+    /// An open line through `points`.
+    pub fn polyline(self: *Document, points: []const [2]f32, opts: LineOptions) !void {
+        if (points.len < 2) return;
+        var p = self.path();
+        try p.moveTo(points[0][0], points[0][1]);
+        for (points[1..]) |pt| try p.lineTo(pt[0], pt[1]);
+        try self.drawPath(&p, .{ .stroke = opts.color, .line_width = opts.width, .dash = opts.dash, .opacity = opts.opacity });
+    }
+
+    const kappa: f32 = 0.5522848;
+
+    /// An empty path to build a shape of lines and curves, then draw it
+    /// (`drawPath`) or clip to it (`clip`). Its memory is the document's.
+    ///
+    /// ```zig
+    /// var heart = doc.path();
+    /// try heart.moveTo(100, 130);
+    /// try heart.curveTo(40, 90, 70, 40, 100, 70);
+    /// try heart.curveTo(130, 40, 160, 90, 100, 130);
+    /// try heart.close();
+    /// try doc.drawPath(&heart, .{ .fill = pdf.Color.hex("#e11d48") });
+    /// ```
+    pub fn path(self: *Document) Path {
+        return .{ .allocator = self.alloc() };
+    }
+
+    /// Fills and/or outlines a path (see `ShapeOptions`: a gradient fills
+    /// it instead of a color).
+    pub fn drawPath(self: *Document, p: *const Path, opts: ShapeOptions) !void {
+        const ops = try self.pathOps(p);
+        const a = self.alloc();
+        if (opts.gradient) |g| {
+            const sh = try self.addShading(g);
+            const c = &self.page().content;
+            try c.appendSlice(a, "q ");
+            if (opts.opacity < 1) try self.setOpacity(opts.opacity);
+            try c.print(a, "{s}{s} n /Sh{d} sh Q\n", .{ ops, if (opts.even_odd) "W*" else "W", sh });
+            if (opts.stroke == null) return;
+            var outline = opts;
+            outline.gradient = null;
+            outline.fill = null;
+            return self.drawPath(p, outline);
+        }
+        const c = &self.page().content;
+        try c.print(a, "q {d:.2} w ", .{opts.line_width});
+        if (opts.opacity < 1) try self.setOpacity(opts.opacity);
+        if (opts.dash) |d| try c.print(a, "[{d:.2} {d:.2}] 0 d ", .{ d[0], d[1] });
+        if (opts.fill) |f| try self.color(f, "rg");
+        try self.color(opts.stroke orelse Color.black, "RG");
+        const op: []const u8 = if (opts.fill != null and opts.stroke != null)
+            (if (opts.even_odd) "B*" else "B")
+        else if (opts.fill != null)
+            (if (opts.even_odd) "f*" else "f")
+        else
+            "S";
+        try c.print(a, "{s}{s} Q\n", .{ ops, op });
+    }
+
+    /// Limits what is drawn next to the inside of `p`, until the matching
+    /// `restoreState` (call `saveState` first). A round photo: save, clip to
+    /// a circle, draw the image, restore.
+    pub fn clip(self: *Document, p: *const Path, opts: struct { even_odd: bool = false }) !void {
+        const ops = try self.pathOps(p);
+        try self.page().content.print(self.alloc(), "{s}{s} n\n", .{ ops, if (opts.even_odd) "W*" else "W" });
+    }
+
+    /// `clip` to a rectangle.
+    pub fn clipRect(self: *Document, x: f32, y: f32, w: f32, h: f32) !void {
+        var p = self.path();
+        try p.rect(x, y, w, h);
+        return self.clip(&p, .{});
+    }
+
+    /// Saves the drawing state (the clip) of the current page, to go back to
+    /// it with `restoreState`. Pairs nest; a page left with some open is
+    /// closed when written.
+    pub fn saveState(self: *Document) !void {
+        try self.page().content.appendSlice(self.alloc(), "q\n");
+        self.page().depth += 1;
+    }
+
+    /// Goes back to the state of the matching `saveState`.
+    pub fn restoreState(self: *Document) !void {
+        if (self.page().depth == 0) return Error.UnbalancedState;
+        try self.page().content.appendSlice(self.alloc(), "Q\n");
+        self.page().depth -= 1;
+    }
+
+    /// The path's operators in this page's coordinates.
+    fn pathOps(self: *Document, p: *const Path) ![]const u8 {
+        const a = self.alloc();
+        const ph = self.height();
+        var out: std.ArrayList(u8) = .empty;
+        for (p.segments.items) |seg| switch (seg) {
+            .move => |m| try out.print(a, "{d:.2} {d:.2} m ", .{ m[0], ph - m[1] }),
+            .line => |l| try out.print(a, "{d:.2} {d:.2} l ", .{ l[0], ph - l[1] }),
+            .curve => |cv| try out.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c ", .{ cv[0], ph - cv[1], cv[2], ph - cv[3], cv[4], ph - cv[5] }),
+            .rect => |r| try out.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} re ", .{ r[0], ph - r[1] - r[3], r[2], r[3] }),
+            .close => try out.appendSlice(a, "h "),
+        };
+        return out.items;
+    }
+
+    fn addShading(self: *Document, g: Gradient) !usize {
+        if (g.stops.len < 2) return Error.InvalidGradient;
+        var last: f32 = -1;
+        for (g.stops) |st| {
+            if (st.offset < 0 or st.offset > 1 or st.offset < last) return Error.InvalidGradient;
+            last = st.offset;
+        }
+        const ph = self.height();
+        var stored = g;
+        stored.from = .{ g.from[0], ph - g.from[1] };
+        stored.to = .{ g.to[0], ph - g.to[1] };
+        stored.stops = try self.alloc().dupe(GradientStop, g.stops);
+        try self.shadings.append(self.alloc(), stored);
+        return self.shadings.items.len - 1;
     }
 
     fn color(self: *Document, c: Color, op: []const u8) !void {
@@ -673,10 +931,124 @@ pub const Document = struct {
             if (b < 0x21 or b > 0x7E) return Error.InvalidUrl;
         }
         const page_h = self.height();
-        try self.page().links.append(self.alloc(), .{
+        try self.page().annots.append(self.alloc(), .{ .uri = .{
             .rect = .{ x, page_h - y - h, x + w, page_h - y },
             .url = try self.alloc().dupe(u8, url),
+        } });
+    }
+
+    /// Makes the rectangle at (x, y) a link to page `page` (from 0) of this
+    /// document, scrolled to `opts.y` from its top (null: the top). The
+    /// page may be added later; it must exist when the document is written.
+    pub fn linkToPage(self: *Document, x: f32, y: f32, w: f32, h: f32, target: usize, opts: struct { y: ?f32 = null }) !void {
+        const page_h = self.height();
+        try self.page().annots.append(self.alloc(), .{ .goto = .{
+            .rect = .{ x, page_h - y - h, x + w, page_h - y },
+            .page = target,
+            .top = opts.y,
+        } });
+    }
+
+    /// Adds an entry to the document's outline, the bookmarks panel of PDF
+    /// readers, pointing at the current page and cursor unless told
+    /// otherwise. Returns it, to nest others under it.
+    ///
+    /// ```zig
+    /// const ch1 = try doc.addBookmark("1. Introduction", .{});
+    /// _ = try doc.addBookmark("1.1 Scope", .{ .parent = ch1 });
+    /// ```
+    pub fn addBookmark(self: *Document, title: []const u8, opts: BookmarkOptions) !Bookmark {
+        if (opts.parent) |p| {
+            if (p.index >= self.outlines.items.len) return Error.UnknownBookmark;
+        }
+        try self.outlines.append(self.alloc(), .{
+            .title = try self.alloc().dupe(u8, title),
+            .page = opts.page orelse self.current,
+            .y = opts.y orelse self.y,
+            .parent = if (opts.parent) |p| p.index else null,
+            .open = opts.open,
         });
+        return .{ .index = @intCast(self.outlines.items.len - 1) };
+    }
+
+    // ── Form fields ─────────────────────────────────────────────────────
+
+    fn newField(self: *Document, name: []const u8, kind: forms.Kind, flags: u32, value: []const u8, size: f32, alignment: Align, border: ?Color, background: ?Color) !*forms.Field {
+        for (self.fields.items) |f| {
+            if (std.mem.eql(u8, f.name, name)) return Error.DuplicateField;
+        }
+        if (kind == .text or kind == .dropdown) self.fonts_used.insert(.helvetica);
+        try self.fields.append(self.alloc(), .{
+            .name = try self.alloc().dupe(u8, name),
+            .kind = kind,
+            .flags = flags,
+            .value = try self.alloc().dupe(u8, value),
+            .size = size,
+            .alignment = alignment,
+            .max_len = null,
+            .border = border,
+            .background = background,
+        });
+        return &self.fields.items[self.fields.items.len - 1];
+    }
+
+    fn addWidget(self: *Document, field: *forms.Field, x: f32, y: f32, w: f32, h: f32, on: []const u8) !void {
+        const page_h = self.height();
+        try field.widgets.append(self.alloc(), .{ .page = self.current, .rect = .{ x, page_h - y - h, x + w, page_h - y }, .on = try self.alloc().dupe(u8, on) });
+        try self.page().annots.append(self.alloc(), .{ .widget = .{ .field = @intCast(self.fields.items.len - 1), .kid = @intCast(field.widgets.items.len - 1) } });
+    }
+
+    /// A text box people can type in, at (x, y) on the current page, named
+    /// `name` (unique in the document). Its value is drawn already, so the
+    /// document shows it filled in every reader.
+    ///
+    /// ```zig
+    /// try doc.textField("customer.name", 40, 100, 300, 20, .{ .value = "Maria" });
+    /// try doc.checkbox("agree", 40, 130, 12, .{ .checked = true });
+    /// ```
+    pub fn textField(self: *Document, name: []const u8, x: f32, y: f32, w: f32, h: f32, opts: TextFieldOptions) !void {
+        const flags = forms.baseFlags(opts.read_only, opts.required) | (if (opts.multiline) @as(u32, 1 << 12) else 0);
+        const f = try self.newField(name, .text, flags, opts.value, opts.size, opts.@"align", opts.border, opts.background);
+        f.max_len = opts.max_length;
+        try self.addWidget(f, x, y, w, h, "");
+    }
+
+    /// A checkbox, `size` points square, at (x, y).
+    pub fn checkbox(self: *Document, name: []const u8, x: f32, y: f32, size: f32, opts: CheckboxOptions) !void {
+        const f = try self.newField(name, .checkbox, forms.baseFlags(opts.read_only, opts.required), if (opts.checked) "Yes" else "", 0, .left, opts.border, opts.background);
+        try self.addWidget(f, x, y, size, size, "Yes");
+    }
+
+    /// A group of radio buttons on the current page, `size` points each: at
+    /// most one is on, and the field's value is its choice.
+    pub fn radioGroup(self: *Document, name: []const u8, choices: []const RadioChoice, size: f32, opts: RadioOptions) !void {
+        if (choices.len == 0) return Error.InvalidField;
+        if (opts.selected) |sel| {
+            for (choices) |c| {
+                if (std.mem.eql(u8, c.value, sel)) break;
+            } else return Error.InvalidField;
+        }
+        // Radio, and a click on the selected one does not turn it off.
+        const flags = forms.baseFlags(opts.read_only, opts.required) | (1 << 15) | (1 << 14);
+        const f = try self.newField(name, .radio, flags, opts.selected orelse "", 0, .left, opts.border, opts.background);
+        for (choices) |c| try self.addWidget(f, c.x, c.y, size, size, c.value);
+    }
+
+    /// A drop-down list of `options`.
+    pub fn dropdown(self: *Document, name: []const u8, x: f32, y: f32, w: f32, h: f32, options: []const []const u8, opts: DropdownOptions) !void {
+        if (options.len == 0) return Error.InvalidField;
+        const value = opts.value orelse options[0];
+        if (!opts.editable) {
+            for (options) |o| {
+                if (std.mem.eql(u8, o, value)) break;
+            } else return Error.InvalidField;
+        }
+        const flags = forms.baseFlags(opts.read_only, opts.required) | (1 << 17) | (if (opts.editable) @as(u32, 1 << 18) else 0);
+        const f = try self.newField(name, .dropdown, flags, value, opts.size, .left, opts.border, opts.background);
+        const copies = try self.alloc().alloc([]const u8, options.len);
+        for (options, copies) |o, *c| c.* = try self.alloc().dupe(u8, o);
+        f.options = copies;
+        try self.addWidget(f, x, y, w, h, "");
     }
 
     // ── Tables ──────────────────────────────────────────────────────────
@@ -694,6 +1066,62 @@ pub const Document = struct {
         errdefer out.deinit();
         try self.write(&out);
         return out.toOwnedSlice();
+    }
+
+    fn writeDest(self: *Document, w: *std.Io.Writer, page_ids: []const usize, target: usize, top: ?f32) !void {
+        if (target >= self.pages.items.len) return Error.NoSuchTarget;
+        try writeDestTo(w, page_ids[target], self.pages.items[target].size.height, top);
+    }
+
+    /// The outline root and its entries: each knows its parent, siblings,
+    /// first and last children, and how many entries open below it.
+    fn writeOutlines(self: *Document, out: *std.Io.Writer.Allocating, offsets: []usize, page_ids: []const usize, root: usize) !void {
+        const a = self.alloc();
+        const w = &out.writer;
+        const items = self.outlines.items;
+        const n = items.len;
+        const first = try a.alloc(?u32, n + 1); // index n: the root
+        const last = try a.alloc(?u32, n + 1);
+        const prev = try a.alloc(?u32, n);
+        const next_sib = try a.alloc(?u32, n);
+        @memset(first, null);
+        @memset(last, null);
+        @memset(prev, null);
+        @memset(next_sib, null);
+        for (items, 0..) |o, i| {
+            const parent = o.parent orelse @as(u32, @intCast(n));
+            if (last[parent]) |l| {
+                next_sib[l] = @intCast(i);
+                prev[i] = l;
+            } else first[parent] = @intCast(i);
+            last[parent] = @intCast(i);
+        }
+        // Entries shown below an entry when it is open (and its open
+        // descendants'), computed from the last entry up: children always
+        // come after their parent.
+        const visible = try a.alloc(i64, n + 1);
+        @memset(visible, 0);
+        var i = n;
+        while (i > 0) {
+            i -= 1;
+            const parent = items[i].parent orelse @as(u32, @intCast(n));
+            visible[parent] += 1 + (if (items[i].open) visible[i] else 0);
+        }
+        offsets[root] = out.written().len;
+        try w.print("{d} 0 obj\n<< /Type /Outlines /First {d} 0 R /Last {d} 0 R /Count {d} >>\nendobj\n", .{ root, root + 1 + first[n].?, root + 1 + last[n].?, visible[n] });
+        for (items, 0..) |o, k| {
+            const id = root + 1 + k;
+            offsets[id] = out.written().len;
+            try w.print("{d} 0 obj\n<< /Title ", .{id});
+            try writeTextString(w, o.title);
+            try w.print(" /Parent {d} 0 R", .{if (o.parent) |p| root + 1 + p else root});
+            if (prev[k]) |p| try w.print(" /Prev {d} 0 R", .{root + 1 + p});
+            if (next_sib[k]) |s| try w.print(" /Next {d} 0 R", .{root + 1 + s});
+            if (first[k]) |f| try w.print(" /First {d} 0 R /Last {d} 0 R /Count {d}", .{ root + 1 + f, root + 1 + last[k].?, if (o.open) visible[k] else -visible[k] });
+            try w.writeAll(" /Dest ");
+            try self.writeDest(w, page_ids, o.page, o.y);
+            try w.writeAll(" >>\nendobj\n");
+        }
     }
 
     fn write(self: *Document, out: *std.Io.Writer.Allocating) !void {
@@ -735,22 +1163,70 @@ pub const Document = struct {
         }
         const first_gs_id = next;
         next += self.alphas.items.len;
+        const first_shading_id = next;
+        next += self.shadings.items.len;
         const content_ids = try a.alloc(usize, self.pages.items.len);
         const page_ids = try a.alloc(usize, self.pages.items.len);
-        const first_link_ids = try a.alloc(usize, self.pages.items.len);
+        const first_annot_ids = try a.alloc(usize, self.pages.items.len);
         for (self.pages.items, 0..) |p, i| {
             content_ids[i] = next;
             page_ids[i] = next + 1;
-            first_link_ids[i] = next + 2;
-            next += 2 + p.links.items.len;
+            first_annot_ids[i] = next + 2;
+            next += 2 + p.annots.items.len;
         }
+        // The outline: its root, then one object per bookmark.
+        const outline_root: usize = if (self.outlines.items.len > 0) next else 0;
+        if (outline_root != 0) next += 1 + self.outlines.items.len;
+
+        // Form fields: a radio group's own object, the appearance streams of
+        // each widget, ZapfDingbats for check marks. A field with one widget
+        // is that widget's annotation.
+        const fields = self.fields.items;
+        const widget_ids = try a.alloc([]usize, fields.len);
+        const ap_ids = try a.alloc([]usize, fields.len);
+        const field_ids = try a.alloc(usize, fields.len);
+        var any_buttons = false;
+        for (fields, 0..) |*f, fi| {
+            widget_ids[fi] = try a.alloc(usize, f.widgets.items.len);
+            ap_ids[fi] = try a.alloc(usize, f.widgets.items.len);
+            if (f.kind == .radio) {
+                field_ids[fi] = next;
+                next += 1;
+            }
+            if (f.kind == .radio or f.kind == .checkbox) any_buttons = true;
+            for (ap_ids[fi]) |*ap| {
+                ap.* = next;
+                next += forms.appearanceCount(f.kind);
+            }
+        }
+        for (self.pages.items, 0..) |p, pi| {
+            for (p.annots.items, 0..) |annot, n| switch (annot) {
+                .widget => |wd| widget_ids[wd.field][wd.kid] = first_annot_ids[pi] + n,
+                else => {},
+            };
+        }
+        for (fields, 0..) |f, fi| {
+            if (f.kind != .radio) field_ids[fi] = widget_ids[fi][0];
+        }
+        const zadb_id: usize = if (any_buttons) next else 0;
+        if (any_buttons) next += 1;
         const object_count = next - 1;
         const offsets = try a.alloc(usize, object_count + 1);
 
         try w.writeAll("%PDF-1.4\n%\xe2\xe3\xcf\xd3\n");
 
         offsets[catalog_id] = out.written().len;
-        try w.print("{d} 0 obj\n<< /Type /Catalog /Pages {d} 0 R >>\nendobj\n", .{ catalog_id, pages_id });
+        try w.print("{d} 0 obj\n<< /Type /Catalog /Pages {d} 0 R", .{ catalog_id, pages_id });
+        if (outline_root != 0) try w.print(" /Outlines {d} 0 R /PageMode /UseOutlines", .{outline_root});
+        if (fields.len > 0) {
+            try w.writeAll(" /AcroForm << /Fields [");
+            for (field_ids) |id| try w.print(" {d} 0 R", .{id});
+            try w.writeAll(" ] /DR << /Font <<");
+            if (self.fonts_used.contains(.helvetica)) try w.print(" /Helv {d} 0 R", .{font_ids.get(.helvetica)});
+            if (zadb_id != 0) try w.print(" /ZaDb {d} 0 R", .{zadb_id});
+            try w.writeAll(" >> >> /DA (/Helv 0 Tf 0 g) >>");
+        }
+        try w.writeAll(" >>\nendobj\n");
 
         offsets[pages_id] = out.written().len;
         try w.print("{d} 0 obj\n<< /Type /Pages /Kids [", .{pages_id});
@@ -776,6 +1252,45 @@ pub const Document = struct {
 
         for (self.embedded.items, embedded_ids) |e, id| {
             if (id != 0) try writeEmbeddedFont(a, out, offsets, e, id);
+        }
+
+        if (zadb_id != 0) {
+            offsets[zadb_id] = out.written().len;
+            try w.print("{d} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /ZapfDingbats >>\nendobj\n", .{zadb_id});
+        }
+        for (fields, 0..) |*f, fi| {
+            if (f.kind == .radio) {
+                offsets[field_ids[fi]] = out.written().len;
+                try w.print("{d} 0 obj\n<<", .{field_ids[fi]});
+                try forms.writeFieldEntries(w, f, writeTextString);
+                try w.writeAll(" /Kids [");
+                for (widget_ids[fi]) |id| try w.print(" {d} 0 R", .{id});
+                try w.writeAll(" ] >>\nendobj\n");
+            }
+            for (f.widgets.items, ap_ids[fi]) |wd, ap| {
+                const bw = wd.rect[2] - wd.rect[0];
+                const bh = wd.rect[3] - wd.rect[1];
+                const streams: [2]?[]const u8 = switch (f.kind) {
+                    .text, .dropdown => .{ try forms.textAppearance(a, f, bw, bh), null },
+                    .checkbox, .radio => .{ try forms.buttonAppearance(a, f, bw, bh, true), try forms.buttonAppearance(a, f, bw, bh, false) },
+                };
+                for (streams, 0..) |maybe, k| {
+                    const data = maybe orelse continue;
+                    offsets[ap + k] = out.written().len;
+                    try w.print("{d} 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 {d:.2} {d:.2}] /Resources << /Font <<", .{ ap + k, bw, bh });
+                    if (f.kind == .text or f.kind == .dropdown) try w.print(" /Helv {d} 0 R", .{font_ids.get(.helvetica)}) else try w.print(" /ZaDb {d} 0 R", .{zadb_id});
+                    try w.print(" >> >> /Length {d} >>\nstream\n", .{data.len});
+                    try w.writeAll(data);
+                    try w.writeAll("\nendstream\nendobj\n");
+                }
+            }
+        }
+
+        for (self.shadings.items, 0..) |g, i| {
+            offsets[first_shading_id + i] = out.written().len;
+            try w.print("{d} 0 obj\n", .{first_shading_id + i});
+            try writeShading(w, g);
+            try w.writeAll("\nendobj\n");
         }
 
         for (self.alphas.items, 0..) |key, i| {
@@ -805,7 +1320,14 @@ pub const Document = struct {
         }
 
         for (self.pages.items, 0..) |p, i| {
-            const raw = p.content.items;
+            // States left saved are closed, so the page ends balanced.
+            var raw: []const u8 = p.content.items;
+            if (p.depth > 0) {
+                var closed: std.ArrayList(u8) = .empty;
+                try closed.appendSlice(a, raw);
+                for (0..p.depth) |_| try closed.appendSlice(a, "Q\n");
+                raw = closed.items;
+            }
             const data = if (self.options.compress) try codec.zlibCompress(a, raw) else raw;
             offsets[content_ids[i]] = out.written().len;
             try w.print("{d} 0 obj\n<< /Length {d}{s} >>\nstream\n", .{ content_ids[i], data.len, if (self.options.compress) " /Filter /FlateDecode" else "" });
@@ -831,26 +1353,50 @@ pub const Document = struct {
                 for (0..self.alphas.items.len) |n| try w.print(" /GS{d} {d} 0 R", .{ n, first_gs_id + n });
                 try w.writeAll(" >>");
             }
+            if (self.shadings.items.len > 0) {
+                try w.writeAll(" /Shading <<");
+                for (0..self.shadings.items.len) |n| try w.print(" /Sh{d} {d} 0 R", .{ n, first_shading_id + n });
+                try w.writeAll(" >>");
+            }
             if (self.images.items.len > 0) {
                 try w.writeAll(" /XObject <<");
                 for (image_ids, 0..) |id, n| try w.print(" /Im{d} {d} 0 R", .{ n, id });
                 try w.writeAll(" >>");
             }
             try w.writeAll(" >>");
-            if (p.links.items.len > 0) {
+            if (p.annots.items.len > 0) {
                 try w.writeAll(" /Annots [");
-                for (0..p.links.items.len) |n| try w.print("{d} 0 R ", .{first_link_ids[i] + n});
+                for (0..p.annots.items.len) |n| try w.print("{d} 0 R ", .{first_annot_ids[i] + n});
                 try w.writeAll("]");
             }
             try w.writeAll(" >>\nendobj\n");
 
-            for (p.links.items, 0..) |l, n| {
-                offsets[first_link_ids[i] + n] = out.written().len;
-                try w.print("{d} 0 obj\n<< /Type /Annot /Subtype /Link /Rect [{d:.2} {d:.2} {d:.2} {d:.2}] /Border [0 0 0] /A << /S /URI /URI ", .{ first_link_ids[i] + n, l.rect[0], l.rect[1], l.rect[2], l.rect[3] });
-                try writeLiteralTo(w, l.url);
-                try w.writeAll(" >> >>\nendobj\n");
+            for (p.annots.items, 0..) |annot, n| {
+                const id = first_annot_ids[i] + n;
+                offsets[id] = out.written().len;
+                switch (annot) {
+                    .uri => |l| {
+                        try w.print("{d} 0 obj\n<< /Type /Annot /Subtype /Link /Rect [{d:.2} {d:.2} {d:.2} {d:.2}] /Border [0 0 0] /A << /S /URI /URI ", .{ id, l.rect[0], l.rect[1], l.rect[2], l.rect[3] });
+                        try writeLiteralTo(w, l.url);
+                        try w.writeAll(" >> >>\nendobj\n");
+                    },
+                    .goto => |l| {
+                        try w.print("{d} 0 obj\n<< /Type /Annot /Subtype /Link /Rect [{d:.2} {d:.2} {d:.2} {d:.2}] /Border [0 0 0] /Dest ", .{ id, l.rect[0], l.rect[1], l.rect[2], l.rect[3] });
+                        try self.writeDest(w, page_ids, l.page, l.top);
+                        try w.writeAll(" >>\nendobj\n");
+                    },
+                    .widget => |wd| {
+                        const f = &fields[wd.field];
+                        try w.print("{d} 0 obj\n<<", .{id});
+                        if (f.kind == .radio) try w.print(" /Parent {d} 0 R", .{field_ids[wd.field]}) else try forms.writeFieldEntries(w, f, writeTextString);
+                        try forms.writeWidgetEntries(w, f, f.widgets.items[wd.kid], page_ids[i], ap_ids[wd.field][wd.kid]);
+                        try w.writeAll(" >>\nendobj\n");
+                    },
+                }
             }
         }
+
+        if (outline_root != 0) try self.writeOutlines(out, offsets, page_ids, outline_root);
 
         const xref = out.written().len;
         try w.print("xref\n0 {d}\n0000000000 65535 f \n", .{object_count + 1});
@@ -858,6 +1404,45 @@ pub const Document = struct {
         try w.print("trailer\n<< /Size {d} /Root {d} 0 R /Info {d} 0 R >>\nstartxref\n{d}\n%%EOF\n", .{ object_count + 1, catalog_id, info_id, xref });
     }
 };
+
+/// A shading dictionary: axial (linear) or radial, RGB, extended past both
+/// ends; two stops are one exponential function, more are stitched.
+fn writeShading(w: *std.Io.Writer, g: Gradient) !void {
+    if (g.kind == .linear) {
+        try w.print("<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [{d:.2} {d:.2} {d:.2} {d:.2}] /Extend [true true] /Function ", .{ g.from[0], g.from[1], g.to[0], g.to[1] });
+    } else {
+        try w.print("<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2}] /Extend [true true] /Function ", .{ g.from[0], g.from[1], g.from_radius, g.to[0], g.to[1], g.to_radius });
+    }
+    const stops = g.stops;
+    if (stops.len == 2) {
+        try writeColorFunction(w, stops[0].color, stops[1].color);
+    } else {
+        try w.writeAll("<< /FunctionType 3 /Domain [0 1] /Functions [");
+        for (0..stops.len - 1) |i| {
+            try w.writeByte(' ');
+            try writeColorFunction(w, stops[i].color, stops[i + 1].color);
+        }
+        try w.writeAll(" ] /Bounds [");
+        for (stops[1 .. stops.len - 1]) |st| try w.print(" {d:.4}", .{st.offset});
+        try w.writeAll(" ] /Encode [");
+        for (0..stops.len - 1) |_| try w.writeAll(" 0 1");
+        try w.writeAll(" ] >>");
+    }
+    try w.writeAll(" >>");
+}
+
+fn writeColorFunction(w: *std.Io.Writer, c0: Color, c1: Color) !void {
+    try w.print("<< /FunctionType 2 /Domain [0 1] /C0 [{d:.3} {d:.3} {d:.3}] /C1 [{d:.3} {d:.3} {d:.3}] /N 1 >>", .{
+        @as(f32, @floatFromInt(c0.r)) / 255, @as(f32, @floatFromInt(c0.g)) / 255, @as(f32, @floatFromInt(c0.b)) / 255,
+        @as(f32, @floatFromInt(c1.r)) / 255, @as(f32, @floatFromInt(c1.g)) / 255, @as(f32, @floatFromInt(c1.b)) / 255,
+    });
+}
+
+/// Where a link or bookmark goes: `[page /XYZ left top null]`, keeping
+/// the zoom.
+fn writeDestTo(w: *std.Io.Writer, page_id: usize, page_height: f32, top: ?f32) !void {
+    try w.print("[{d} 0 R /XYZ 0 {d:.2} null]", .{ page_id, page_height - (top orelse 0) });
+}
 
 /// Writes the five objects of an embedded TrueType font, numbered from
 /// `id`: a Type0 font (Identity-H: two-byte codes that are glyph numbers),
@@ -1304,6 +1889,150 @@ test "a rotated, translucent image turns around its center" {
     const c = doc.pages.items[0].content.items;
     try t.expect(contains(c, "q /GS0 gs 1 0 0 1 20.00 85.00 cm -1.0000"));
     try t.expect(contains(c, "20.00 0 0 10.00 -10.00 -5.00 cm /Im0 Do Q"));
+}
+
+test "bookmarks: nested, with parents, siblings, counts and destinations" {
+    var doc = try Document.init(t.allocator, .{ .size = .{ .width = 100, .height = 200 } });
+    defer doc.deinit();
+    const intro = try doc.addBookmark("1. Introdução", .{});
+    doc.y = 120;
+    _ = try doc.addBookmark("1.1 Scope", .{ .parent = intro });
+    try doc.addPage();
+    const closed = try doc.addBookmark("2. Annex", .{ .open = false });
+    _ = try doc.addBookmark("2.1 Data", .{ .parent = closed });
+    _ = try doc.addBookmark("2.2 More", .{ .parent = closed });
+    try t.expectError(Error.UnknownBookmark, doc.addBookmark("x", .{ .parent = .{ .index = 99 } }));
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    try t.expect(contains(pdf, "/PageMode /UseOutlines"));
+    // Root: two top entries, plus the open one's child.
+    try t.expect(contains(pdf, "/Type /Outlines"));
+    try t.expect(contains(pdf, "/Count 3 >>"));
+    try t.expect(contains(pdf, "/Title <FEFF0031002E00200049006E00740072006F0064007500E700E3006F>"));
+    try t.expect(contains(pdf, "/Title (1.1 Scope)"));
+    try t.expect(contains(pdf, "/Count -2")); // closed, two children hidden
+    // The cursor at 120 from the top of a 200-point page: 80 from the bottom.
+    try t.expect(contains(pdf, "/XYZ 0 80.00 null]"));
+}
+
+test "links to pages of the document, forward ones too, and a missing one" {
+    var doc = try Document.init(t.allocator, .{ .size = .{ .width = 100, .height = 200 } });
+    defer doc.deinit();
+    try doc.linkToPage(10, 10, 50, 12, 1, .{ .y = 50 });
+    try doc.addPage();
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    try t.expect(contains(pdf, "/Subtype /Link /Rect [10.00 178.00 60.00 190.00] /Border [0 0 0] /Dest ["));
+    try t.expect(contains(pdf, "/XYZ 0 150.00 null]"));
+    try doc.linkToPage(0, 0, 1, 1, 7, .{});
+    try t.expectError(Error.NoSuchTarget, doc.toBytes(t.allocator));
+}
+
+test "form fields: text, checkbox, radio group and drop-down, in the AcroForm" {
+    var doc = try Document.init(t.allocator, .{ .compress = false, .size = .{ .width = 300, .height = 300 } });
+    defer doc.deinit();
+    try doc.textField("name", 10, 10, 200, 20, .{ .value = "Maria José", .required = true });
+    try doc.textField("notes", 10, 40, 200, 60, .{ .multiline = true, .max_length = 500 });
+    try doc.checkbox("agree", 10, 110, 12, .{ .checked = true });
+    try doc.radioGroup("plan", &.{ .{ .value = "basic", .x = 10, .y = 130 }, .{ .value = "pro", .x = 40, .y = 130 } }, 12, .{ .selected = "pro" });
+    try doc.dropdown("city", 10, 150, 120, 20, &.{ "Goiânia", "Brasília" }, .{ .value = "Brasília" });
+    try t.expectError(Error.DuplicateField, doc.checkbox("agree", 0, 0, 10, .{}));
+    try t.expectError(Error.InvalidField, doc.radioGroup("r", &.{}, 10, .{}));
+    try t.expectError(Error.InvalidField, doc.radioGroup("r2", &.{.{ .value = "a", .x = 0, .y = 0 }}, 10, .{ .selected = "zzz" }));
+    try t.expectError(Error.InvalidField, doc.dropdown("d", 0, 0, 10, 10, &.{"a"}, .{ .value = "b" }));
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    try t.expect(contains(pdf, "/AcroForm << /Fields ["));
+    try t.expect(contains(pdf, "/DR << /Font << /Helv "));
+    try t.expect(contains(pdf, " /ZaDb "));
+    try t.expect(contains(pdf, "/FT /Tx /T (name) /Ff 2 /DA (/Helv 0.00 Tf 0 g) /V <FEFF"));
+    try t.expect(contains(pdf, "/Ff 4096"));
+    try t.expect(contains(pdf, "/MaxLen 500"));
+    try t.expect(contains(pdf, "/FT /Btn /T (agree) /DA (/ZaDb 0 Tf 0 g) /V /Yes"));
+    try t.expect(contains(pdf, "/AS /Yes /AP << /N << /Yes "));
+    try t.expect(contains(pdf, "/FT /Btn /T (plan) /Ff 49152 /DA (/ZaDb 0 Tf 0 g) /V /pro /Kids ["));
+    try t.expect(contains(pdf, "/AS /Off /AP << /N << /basic "));
+    try t.expect(contains(pdf, "/AS /pro /AP << /N << /pro "));
+    try t.expect(contains(pdf, "/FT /Ch /T (city) /Ff 131072"));
+    try t.expect(contains(pdf, "/Opt [ <FEFF"));
+    try t.expect(contains(pdf, "(Maria Jos\xe9) Tj"));
+    try t.expect(contains(pdf, "(4) Tj"));
+}
+
+test "paths: lines, cubic and quadratic curves, polygons, even-odd holes" {
+    var doc = try Document.init(t.allocator, .{ .compress = false, .size = .{ .width = 100, .height = 100 } });
+    defer doc.deinit();
+    var p = doc.path();
+    try p.moveTo(10, 10);
+    try p.lineTo(50, 10);
+    try p.curveTo(60, 20, 60, 30, 50, 40);
+    try p.quadTo(30, 60, 10, 40);
+    try p.close();
+    try doc.drawPath(&p, .{ .fill = Color.black, .stroke = Color.white });
+    try doc.polygon(&.{ .{ 0, 0 }, .{ 10, 0 }, .{ 5, 10 } }, .{ .fill = Color.black });
+    try doc.polyline(&.{ .{ 0, 0 }, .{ 10, 10 }, .{ 20, 0 } }, .{ .dash = .{ 2, 1 } });
+    var ring = doc.path();
+    try ring.ellipse(50, 50, 20, 20);
+    try ring.ellipse(50, 50, 10, 10);
+    try doc.drawPath(&ring, .{ .fill = Color.black, .even_odd = true });
+    const c = doc.pages.items[0].content.items;
+    try t.expect(contains(c, "10.00 90.00 m 50.00 90.00 l 60.00 80.00 60.00 70.00 50.00 60.00 c "));
+    // The quadratic curve as its cubic: control points 2/3 of the way.
+    try t.expect(contains(c, "36.67 46.67 23.33 46.67 10.00 60.00 c h B Q"));
+    try t.expect(contains(c, "0.00 100.00 m 10.00 100.00 l 5.00 90.00 l h f Q"));
+    try t.expect(contains(c, "[2.00 1.00] 0 d"));
+    try t.expect(contains(c, "20.00 100.00 l S Q"));
+    try t.expect(contains(c, "h f* Q"));
+}
+
+test "gradients: linear and radial, two stops or stitched, clipped to the shape" {
+    var doc = try Document.init(t.allocator, .{ .size = .{ .width = 100, .height = 100 } });
+    defer doc.deinit();
+    const stops = [_]GradientStop{ .{ .offset = 0, .color = Color.hex("#ff0000") }, .{ .offset = 1, .color = Color.hex("#0000ff") } };
+    try doc.rect(0, 0, 100, 50, .{ .gradient = Gradient.linear(0, 0, 100, 0, &stops), .stroke = Color.black });
+    const three = [_]GradientStop{ .{ .offset = 0, .color = Color.white }, .{ .offset = 0.25, .color = Color.gray }, .{ .offset = 1, .color = Color.black } };
+    try doc.circle(50, 75, 20, .{ .gradient = Gradient.radial(50, 75, 20, &three) });
+    const bad = [_]GradientStop{ .{ .offset = 0.5, .color = Color.white }, .{ .offset = 0.2, .color = Color.black } };
+    try t.expectError(Error.InvalidGradient, doc.rect(0, 0, 1, 1, .{ .gradient = Gradient.linear(0, 0, 1, 1, &bad) }));
+    try t.expectError(Error.InvalidGradient, doc.rect(0, 0, 1, 1, .{ .gradient = Gradient.linear(0, 0, 1, 1, stops[0..1]) }));
+    const c = doc.pages.items[0].content.items;
+    try t.expect(contains(c, "q 0.00 50.00 100.00 50.00 re W n /Sh0 sh Q"));
+    try t.expect(contains(c, "re S Q")); // the outline, drawn after
+    try t.expect(contains(c, "W n /Sh1 sh Q"));
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    try t.expect(contains(pdf, "/ShadingType 2 /ColorSpace /DeviceRGB /Coords [0.00 100.00 100.00 100.00]"));
+    try t.expect(contains(pdf, "/C0 [1.000 0.000 0.000] /C1 [0.000 0.000 1.000]"));
+    try t.expect(contains(pdf, "/ShadingType 3"));
+    try t.expect(contains(pdf, "/FunctionType 3 /Domain [0 1] /Functions ["));
+    try t.expect(contains(pdf, "/Bounds [ 0.2500 ] /Encode [ 0 1 0 1 ]"));
+    try t.expect(contains(pdf, "/Shading << /Sh0 "));
+}
+
+test "clipping inside saved states, and pages closed balanced" {
+    var doc = try Document.init(t.allocator, .{ .compress = false, .size = .{ .width = 100, .height = 100 } });
+    defer doc.deinit();
+    try doc.saveState();
+    var round = doc.path();
+    try round.ellipse(50, 50, 10, 10);
+    try doc.clip(&round, .{});
+    try doc.rect(0, 0, 100, 100, .{ .fill = Color.black });
+    try doc.restoreState();
+    try t.expectError(Error.UnbalancedState, doc.restoreState());
+    try doc.saveState();
+    try doc.clipRect(0, 0, 10, 10); // left open
+    const c = doc.pages.items[0].content.items;
+    try t.expect(contains(c, "q\n60.00 50.00 m "));
+    try t.expect(contains(c, "c h W n\n"));
+    try t.expect(contains(c, "Q\nq\n0.00 90.00 10.00 10.00 re W n\n"));
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    try t.expect(contains(pdf, "re W n\nQ\n\nendstream"));
 }
 
 test "Color.hex reads #rrggbb" {
