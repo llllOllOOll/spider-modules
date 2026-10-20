@@ -1,0 +1,906 @@
+//! A PDF document drawn page by page: text, wrapped text, tables, lines,
+//! rectangles, ellipses, PNG and JPEG images and links, written out as a
+//! PDF 1.4 file with compressed page contents.
+//!
+//! Coordinates are points (1/72 inch) from the TOP-LEFT corner of the
+//! page, the way screens and HTML measure: `y` grows downwards. The PDF's
+//! own bottom-up coordinates are dealt with when the operators are
+//! written.
+//!
+//! Two ways to place things, freely mixed:
+//!
+//! - absolute: `text(x, y, ...)`, `rect(...)`, `image(...)` at given points;
+//! - flowing: `paragraph(...)` and `table(...)` write at the cursor
+//!   (`doc.y`, starting at the top margin), move it down, and start a new
+//!   page when the next line or row does not fit above the bottom margin.
+//!
+//! Everything the document holds lives in its own arena: `deinit` frees it
+//! all at once. `toBytes` returns the finished file in memory the caller
+//! owns.
+
+const std = @import("std");
+const fonts = @import("fonts.zig");
+const text_mod = @import("text.zig");
+const codec = @import("image.zig");
+const table_mod = @import("table.zig");
+
+pub const Font = fonts.Font;
+pub const Column = table_mod.Column;
+pub const TableOptions = table_mod.TableOptions;
+
+/// A page size in points.
+pub const Size = struct {
+    width: f32,
+    height: f32,
+
+    pub const a4: Size = .{ .width = 595.28, .height = 841.89 };
+    pub const a5: Size = .{ .width = 419.53, .height = 595.28 };
+    pub const letter: Size = .{ .width = 612, .height = 792 };
+    pub const legal: Size = .{ .width = 612, .height = 1008 };
+
+    /// The same size turned sideways.
+    pub fn landscape(self: Size) Size {
+        return .{ .width = @max(self.width, self.height), .height = @min(self.width, self.height) };
+    }
+};
+
+/// An RGB color.
+pub const Color = struct {
+    r: u8,
+    g: u8,
+    b: u8,
+
+    pub const black: Color = .{ .r = 0, .g = 0, .b = 0 };
+    pub const white: Color = .{ .r = 255, .g = 255, .b = 255 };
+    pub const gray: Color = .{ .r = 0x6b, .g = 0x72, .b = 0x80 };
+    pub const light_gray: Color = .{ .r = 0xe5, .g = 0xe7, .b = 0xeb };
+
+    /// A color from "#rrggbb" (or "rrggbb"), checked at compile time.
+    pub fn hex(comptime s: []const u8) Color {
+        return comptime blk: {
+            const h = if (s.len > 0 and s[0] == '#') s[1..] else s;
+            if (h.len != 6) @compileError("Color.hex wants \"#rrggbb\", got \"" ++ s ++ "\"");
+            const v = std.fmt.parseInt(u24, h, 16) catch @compileError("Color.hex: not hex digits: \"" ++ s ++ "\"");
+            break :blk .{ .r = @truncate(v >> 16), .g = @truncate(v >> 8), .b = @truncate(v) };
+        };
+    }
+};
+
+pub const Align = enum { left, center, right };
+
+/// The document's properties, shown by PDF readers (File > Properties).
+pub const Info = struct {
+    title: ?[]const u8 = null,
+    author: ?[]const u8 = null,
+    subject: ?[]const u8 = null,
+    keywords: ?[]const u8 = null,
+    /// The application that made the document.
+    creator: ?[]const u8 = null,
+};
+
+pub const Options = struct {
+    size: Size = Size.a4,
+    /// Space kept free on every side by the flowing calls (`paragraph`,
+    /// `table`) and where the cursor starts on each page.
+    margin: f32 = 40,
+    /// Compress the page contents (FlateDecode). Off only to read the
+    /// operators while debugging.
+    compress: bool = true,
+    info: Info = .{},
+};
+
+pub const TextOptions = struct {
+    font: Font = .helvetica,
+    size: f32 = 11,
+    color: Color = Color.black,
+    /// For `text`: which side of the text `x` is. For boxes: where each
+    /// line sits in the box.
+    @"align": Align = .left,
+    /// Distance between baselines in wrapped text, as a multiple of `size`.
+    line_height: f32 = 1.25,
+};
+
+pub const LineOptions = struct {
+    color: Color = Color.black,
+    width: f32 = 1,
+    /// Dash and gap lengths, e.g. `.{ 3, 2 }`; null draws a solid line.
+    dash: ?[2]f32 = null,
+};
+
+pub const ShapeOptions = struct {
+    fill: ?Color = null,
+    /// When neither `fill` nor `stroke` is given, the outline is drawn in
+    /// black.
+    stroke: ?Color = null,
+    line_width: f32 = 1,
+    /// Corner radius of a rectangle.
+    radius: f32 = 0,
+};
+
+pub const ImageOptions = struct {
+    /// Given one of the two, the other follows the image's proportions;
+    /// given neither, one pixel is one point.
+    width: ?f32 = null,
+    height: ?f32 = null,
+};
+
+/// An image added to the document, drawn with `Document.image` as many
+/// times as needed: its bytes are stored once.
+pub const Image = struct {
+    index: usize,
+    /// Size in pixels.
+    width: u32,
+    height: u32,
+};
+
+pub const Error = error{
+    /// `setPage` with an index past the last page.
+    NoSuchPage,
+    /// A link address with characters outside printable ASCII
+    /// (percent-encode them first).
+    InvalidUrl,
+    /// An image that does not belong to this document.
+    UnknownImage,
+};
+
+const Link = struct { rect: [4]f32, url: []const u8 };
+
+const Page = struct {
+    size: Size,
+    content: std.ArrayList(u8) = .empty,
+    links: std.ArrayList(Link) = .empty,
+};
+
+const StoredImage = struct {
+    encoded: codec.Encoded,
+    hash: u64,
+    len: usize,
+};
+
+pub const Document = struct {
+    arena: std.heap.ArenaAllocator,
+    options: Options,
+    pages: std.ArrayList(Page) = .empty,
+    current: usize = 0,
+    images: std.ArrayList(StoredImage) = .empty,
+    fonts_used: std.EnumSet(Font) = .empty,
+    /// The flowing cursor: where the next `paragraph` or `table` starts,
+    /// in points from the top of the current page.
+    y: f32 = 0,
+
+    /// A document with one empty page.
+    ///
+    /// ```zig
+    /// var doc = try pdf.Document.init(allocator, .{ .info = .{ .title = "Invoice 42" } });
+    /// defer doc.deinit();
+    /// try doc.text(40, 60, "Invoice 42", .{ .font = .helvetica_bold, .size = 18 });
+    /// try doc.paragraph("Thank you for your order.", .{});
+    /// const bytes = try doc.toBytes(allocator);
+    /// defer allocator.free(bytes);
+    /// ```
+    pub fn init(allocator: std.mem.Allocator, options: Options) !Document {
+        var doc: Document = .{ .arena = .init(allocator), .options = options };
+        errdefer doc.arena.deinit();
+        try doc.addPage();
+        return doc;
+    }
+
+    /// Frees everything the document holds.
+    pub fn deinit(self: *Document) void {
+        self.arena.deinit();
+    }
+
+    fn alloc(self: *Document) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    fn page(self: *Document) *Page {
+        return &self.pages.items[self.current];
+    }
+
+    // ── Pages and the cursor ────────────────────────────────────────────
+
+    /// Adds a page of the document's size and makes it current; the
+    /// cursor goes to its top margin.
+    pub fn addPage(self: *Document) !void {
+        return self.addPageSized(self.options.size);
+    }
+
+    /// Adds a page of another size (a landscape page in a portrait
+    /// document, say) and makes it current.
+    pub fn addPageSized(self: *Document, size: Size) !void {
+        try self.pages.append(self.alloc(), .{ .size = size });
+        self.current = self.pages.items.len - 1;
+        self.y = self.options.margin;
+    }
+
+    pub fn pageCount(self: *const Document) usize {
+        return self.pages.items.len;
+    }
+
+    /// Makes page `index` (from 0) current, to draw on it again: page
+    /// numbers in a footer once the page count is known, for one. The
+    /// cursor goes to its top margin.
+    pub fn setPage(self: *Document, index: usize) Error!void {
+        if (index >= self.pages.items.len) return Error.NoSuchPage;
+        self.current = index;
+        self.y = self.options.margin;
+    }
+
+    /// Width of the current page.
+    pub fn width(self: *Document) f32 {
+        return self.page().size.width;
+    }
+
+    /// Height of the current page.
+    pub fn height(self: *Document) f32 {
+        return self.page().size.height;
+    }
+
+    /// Width between the left and right margins.
+    pub fn contentWidth(self: *Document) f32 {
+        return self.width() - 2 * self.options.margin;
+    }
+
+    /// Where the flowing content of the current page must end.
+    pub fn bottom(self: *Document) f32 {
+        return self.height() - self.options.margin;
+    }
+
+    /// Moves the cursor down by `dy` points.
+    pub fn moveDown(self: *Document, dy: f32) void {
+        self.y += dy;
+    }
+
+    /// Starts a new page unless `h` more points fit above the bottom margin.
+    pub fn ensureSpace(self: *Document, h: f32) !void {
+        if (self.y + h > self.bottom()) try self.addPage();
+    }
+
+    // ── Text ────────────────────────────────────────────────────────────
+
+    /// The width of `str` (UTF-8) in points.
+    pub fn textWidth(str: []const u8, font: Font, size: f32) f32 {
+        return fonts.widthUtf8(str, font, size);
+    }
+
+    /// Writes one line of text with its baseline at `y`. `opts.align`
+    /// says where `x` is: the left end, the middle or the right end. Line
+    /// breaks in `str` become spaces (see `textBox` for several lines).
+    pub fn text(self: *Document, x: f32, y: f32, str: []const u8, opts: TextOptions) !void {
+        const encoded = try self.encode(str);
+        for (encoded) |*b| {
+            if (b.* == '\n') b.* = ' ';
+        }
+        try self.writeLine(x, y, encoded, opts);
+    }
+
+    fn writeLine(self: *Document, x: f32, y: f32, encoded: []const u8, opts: TextOptions) !void {
+        const w = fonts.width(encoded, opts.font, opts.size);
+        const left = switch (opts.@"align") {
+            .left => x,
+            .center => x - w / 2,
+            .right => x - w,
+        };
+        self.fonts_used.insert(opts.font);
+        const c = &self.page().content;
+        try c.print(self.alloc(), "BT /F{d} {d:.2} Tf ", .{ @backingInt(opts.font), opts.size });
+        try self.color(opts.color, "rg");
+        try c.print(self.alloc(), "{d:.2} {d:.2} Td ", .{ left, self.height() - y });
+        try writeLiteral(self.alloc(), c, encoded);
+        try c.appendSlice(self.alloc(), " Tj ET\n");
+    }
+
+    /// Writes `str` wrapped to `box_width`, its first line's top at `y`
+    /// (the box's top, not a baseline). Returns the height the lines take.
+    pub fn textBox(self: *Document, x: f32, y: f32, box_width: f32, str: []const u8, opts: TextOptions) !f32 {
+        const lines = try self.wrapLines(str, box_width, opts);
+        const step = opts.size * opts.line_height;
+        for (lines, 0..) |ln, i| {
+            const baseline = y + opts.size * opts.font.ascent() + @as(f32, @floatFromInt(i)) * step;
+            const anchor = switch (opts.@"align") {
+                .left => x,
+                .center => x + box_width / 2,
+                .right => x + box_width,
+            };
+            try self.writeLine(anchor, baseline, ln, opts);
+        }
+        return @as(f32, @floatFromInt(lines.len)) * step;
+    }
+
+    /// The height `textBox` would take for `str` at `box_width`.
+    pub fn measureText(self: *Document, str: []const u8, box_width: f32, opts: TextOptions) !f32 {
+        const lines = try self.wrapLines(str, box_width, opts);
+        return @as(f32, @floatFromInt(lines.len)) * opts.size * opts.line_height;
+    }
+
+    /// Writes `str` wrapped between the margins at the cursor, one line at
+    /// a time: a line that does not fit above the bottom margin goes to a
+    /// new page. Moves the cursor below the text.
+    pub fn paragraph(self: *Document, str: []const u8, opts: TextOptions) !void {
+        const left = self.options.margin;
+        const lines = try self.wrapLines(str, self.contentWidth(), opts);
+        const step = opts.size * opts.line_height;
+        for (lines) |ln| {
+            try self.ensureSpace(step);
+            const anchor = switch (opts.@"align") {
+                .left => left,
+                .center => left + self.contentWidth() / 2,
+                .right => left + self.contentWidth(),
+            };
+            try self.writeLine(anchor, self.y + opts.size * opts.font.ascent(), ln, opts);
+            self.y += step;
+        }
+    }
+
+    fn wrapLines(self: *Document, str: []const u8, box_width: f32, opts: TextOptions) ![][]const u8 {
+        const encoded = try self.encode(str);
+        return text_mod.wrap(self.alloc(), encoded, box_width, opts.font, opts.size);
+    }
+
+    fn encode(self: *Document, str: []const u8) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        try fonts.encode(self.alloc(), &out, str);
+        return out.items;
+    }
+
+    // ── Shapes ──────────────────────────────────────────────────────────
+
+    /// A straight line between two points.
+    pub fn line(self: *Document, x1: f32, y1: f32, x2: f32, y2: f32, opts: LineOptions) !void {
+        const c = &self.page().content;
+        try c.print(self.alloc(), "q {d:.2} w ", .{opts.width});
+        if (opts.dash) |d| try c.print(self.alloc(), "[{d:.2} {d:.2}] 0 d ", .{ d[0], d[1] });
+        try self.color(opts.color, "RG");
+        try c.print(self.alloc(), "{d:.2} {d:.2} m {d:.2} {d:.2} l S Q\n", .{ x1, self.height() - y1, x2, self.height() - y2 });
+    }
+
+    /// A rectangle with its top-left corner at (x, y), filled, outlined or
+    /// both, with rounded corners when `opts.radius` is set.
+    pub fn rect(self: *Document, x: f32, y: f32, w: f32, h: f32, opts: ShapeOptions) !void {
+        try self.beginShape(opts);
+        const c = &self.page().content;
+        const bottom_y = self.height() - y - h;
+        const r = @min(opts.radius, @min(w, h) / 2);
+        if (r <= 0) {
+            try c.print(self.alloc(), "{d:.2} {d:.2} {d:.2} {d:.2} re ", .{ x, bottom_y, w, h });
+        } else {
+            // Four sides joined by quarter circles (Bezier, kappa ≈ 0.5523).
+            const k = r * kappa;
+            const x2 = x + w;
+            const y2 = bottom_y + h;
+            const a = self.alloc();
+            try c.print(a, "{d:.2} {d:.2} m ", .{ x + r, bottom_y });
+            try c.print(a, "{d:.2} {d:.2} l ", .{ x2 - r, bottom_y });
+            try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c ", .{ x2 - r + k, bottom_y, x2, bottom_y + r - k, x2, bottom_y + r });
+            try c.print(a, "{d:.2} {d:.2} l ", .{ x2, y2 - r });
+            try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c ", .{ x2, y2 - r + k, x2 - r + k, y2, x2 - r, y2 });
+            try c.print(a, "{d:.2} {d:.2} l ", .{ x + r, y2 });
+            try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c ", .{ x + r - k, y2, x, y2 - r + k, x, y2 - r });
+            try c.print(a, "{d:.2} {d:.2} l ", .{ x, bottom_y + r });
+            try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c h ", .{ x, bottom_y + r - k, x + r - k, bottom_y, x + r, bottom_y });
+        }
+        try self.endShape(opts);
+    }
+
+    /// An ellipse centered on (cx, cy).
+    pub fn ellipse(self: *Document, cx: f32, cy: f32, rx: f32, ry: f32, opts: ShapeOptions) !void {
+        try self.beginShape(opts);
+        const c = &self.page().content;
+        const a = self.alloc();
+        const y = self.height() - cy;
+        const kx = rx * kappa;
+        const ky = ry * kappa;
+        try c.print(a, "{d:.2} {d:.2} m ", .{ cx + rx, y });
+        try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c ", .{ cx + rx, y + ky, cx + kx, y + ry, cx, y + ry });
+        try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c ", .{ cx - kx, y + ry, cx - rx, y + ky, cx - rx, y });
+        try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c ", .{ cx - rx, y - ky, cx - kx, y - ry, cx, y - ry });
+        try c.print(a, "{d:.2} {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} c h ", .{ cx + kx, y - ry, cx + rx, y - ky, cx + rx, y });
+        try self.endShape(opts);
+    }
+
+    /// A circle centered on (cx, cy).
+    pub fn circle(self: *Document, cx: f32, cy: f32, r: f32, opts: ShapeOptions) !void {
+        return self.ellipse(cx, cy, r, r, opts);
+    }
+
+    const kappa: f32 = 0.5522848;
+
+    fn beginShape(self: *Document, opts: ShapeOptions) !void {
+        const c = &self.page().content;
+        try c.print(self.alloc(), "q {d:.2} w ", .{opts.line_width});
+        if (opts.fill) |f| try self.color(f, "rg");
+        try self.color(opts.stroke orelse Color.black, "RG");
+    }
+
+    fn endShape(self: *Document, opts: ShapeOptions) !void {
+        const op: []const u8 = if (opts.fill != null and opts.stroke != null) "B" else if (opts.fill != null) "f" else "S";
+        try self.page().content.print(self.alloc(), "{s} Q\n", .{op});
+    }
+
+    fn color(self: *Document, c: Color, op: []const u8) !void {
+        try self.page().content.print(self.alloc(), "{d:.3} {d:.3} {d:.3} {s} ", .{
+            @as(f32, @floatFromInt(c.r)) / 255,
+            @as(f32, @floatFromInt(c.g)) / 255,
+            @as(f32, @floatFromInt(c.b)) / 255,
+            op,
+        });
+    }
+
+    // ── Images and links ────────────────────────────────────────────────
+
+    /// Adds a PNG or JPEG file. The same bytes added twice are stored once.
+    /// A JPEG's bytes are kept as they are: they must outlive the document
+    /// (an `@embedFile`, or memory freed after `toBytes`).
+    pub fn addImage(self: *Document, bytes: []const u8) !Image {
+        const hash = std.hash.Wyhash.hash(0, bytes);
+        for (self.images.items, 0..) |stored, i| {
+            if (stored.hash == hash and stored.len == bytes.len) {
+                return .{ .index = i, .width = stored.encoded.width, .height = stored.encoded.height };
+            }
+        }
+        const encoded = try codec.load(self.alloc(), bytes);
+        try self.images.append(self.alloc(), .{ .encoded = encoded, .hash = hash, .len = bytes.len });
+        return .{ .index = self.images.items.len - 1, .width = encoded.width, .height = encoded.height };
+    }
+
+    /// Draws an image with its top-left corner at (x, y).
+    pub fn image(self: *Document, img: Image, x: f32, y: f32, opts: ImageOptions) !void {
+        if (img.index >= self.images.items.len) return Error.UnknownImage;
+        const pw: f32 = @floatFromInt(img.width);
+        const ph: f32 = @floatFromInt(img.height);
+        const w = opts.width orelse if (opts.height) |h| h * pw / ph else pw;
+        const h = opts.height orelse if (opts.width) |ow| ow * ph / pw else ph;
+        try self.page().content.print(self.alloc(), "q {d:.2} 0 0 {d:.2} {d:.2} {d:.2} cm /Im{d} Do Q\n", .{ w, h, x, self.height() - y - h, img.index });
+    }
+
+    /// Makes the rectangle at (x, y) a link to `url`: a click opens it.
+    pub fn link(self: *Document, x: f32, y: f32, w: f32, h: f32, url: []const u8) !void {
+        for (url) |b| {
+            if (b < 0x21 or b > 0x7E) return Error.InvalidUrl;
+        }
+        const page_h = self.height();
+        try self.page().links.append(self.alloc(), .{
+            .rect = .{ x, page_h - y - h, x + w, page_h - y },
+            .url = try self.alloc().dupe(u8, url),
+        });
+    }
+
+    // ── Tables ──────────────────────────────────────────────────────────
+
+    /// A table at the cursor, between the margins (see table.zig).
+    pub fn table(self: *Document, columns: []const Column, rows: []const []const []const u8, opts: TableOptions) !void {
+        return table_mod.draw(self, columns, rows, opts);
+    }
+
+    // ── Output ──────────────────────────────────────────────────────────
+
+    /// The finished PDF file, allocated with `allocator`.
+    pub fn toBytes(self: *Document, allocator: std.mem.Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        try self.write(&out);
+        return out.toOwnedSlice();
+    }
+
+    fn write(self: *Document, out: *std.Io.Writer.Allocating) !void {
+        const a = self.alloc();
+        const w = &out.writer;
+
+        // Object numbers, decided before anything is written: the page
+        // tree lists its pages, and pages name their fonts and images.
+        const catalog_id = 1;
+        const pages_id = 2;
+        const info_id = 3;
+        var next: usize = 4;
+
+        var font_ids: std.EnumArray(Font, usize) = .initFill(0);
+        var it = self.fonts_used.iterator();
+        while (it.next()) |f| {
+            font_ids.set(f, next);
+            next += 1;
+        }
+        const image_ids = try a.alloc(usize, self.images.items.len);
+        const mask_ids = try a.alloc(usize, self.images.items.len);
+        for (self.images.items, 0..) |img, i| {
+            image_ids[i] = next;
+            next += 1;
+            mask_ids[i] = 0;
+            if (img.encoded.alpha != null) {
+                mask_ids[i] = next;
+                next += 1;
+            }
+        }
+        const content_ids = try a.alloc(usize, self.pages.items.len);
+        const page_ids = try a.alloc(usize, self.pages.items.len);
+        const first_link_ids = try a.alloc(usize, self.pages.items.len);
+        for (self.pages.items, 0..) |p, i| {
+            content_ids[i] = next;
+            page_ids[i] = next + 1;
+            first_link_ids[i] = next + 2;
+            next += 2 + p.links.items.len;
+        }
+        const object_count = next - 1;
+        const offsets = try a.alloc(usize, object_count + 1);
+
+        try w.writeAll("%PDF-1.4\n%\xe2\xe3\xcf\xd3\n");
+
+        offsets[catalog_id] = out.written().len;
+        try w.print("{d} 0 obj\n<< /Type /Catalog /Pages {d} 0 R >>\nendobj\n", .{ catalog_id, pages_id });
+
+        offsets[pages_id] = out.written().len;
+        try w.print("{d} 0 obj\n<< /Type /Pages /Kids [", .{pages_id});
+        for (page_ids) |id| try w.print("{d} 0 R ", .{id});
+        try w.print("] /Count {d} >>\nendobj\n", .{self.pages.items.len});
+
+        offsets[info_id] = out.written().len;
+        try w.print("{d} 0 obj\n<< /Producer (Spider PDF)", .{info_id});
+        const info = self.options.info;
+        inline for (.{ .{ "Title", info.title }, .{ "Author", info.author }, .{ "Subject", info.subject }, .{ "Keywords", info.keywords }, .{ "Creator", info.creator } }) |entry| {
+            if (entry[1]) |value| {
+                try w.print(" /{s} ", .{entry[0]});
+                try writeTextString(w, value);
+            }
+        }
+        try w.writeAll(" >>\nendobj\n");
+
+        it = self.fonts_used.iterator();
+        while (it.next()) |f| {
+            offsets[font_ids.get(f)] = out.written().len;
+            try w.print("{d} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /{s} /Encoding /WinAnsiEncoding >>\nendobj\n", .{ font_ids.get(f), f.baseName() });
+        }
+
+        for (self.images.items, 0..) |stored, i| {
+            const img = stored.encoded;
+            offsets[image_ids[i]] = out.written().len;
+            try w.print("{d} 0 obj\n<< /Type /XObject /Subtype /Image /Width {d} /Height {d} /ColorSpace {s} /BitsPerComponent 8 /Filter {s}", .{
+                image_ids[i],                                             img.width, img.height, img.color_space.pdfName(),
+                if (img.filter == .dct) "/DCTDecode" else "/FlateDecode",
+            });
+            if (img.inverted_cmyk) try w.writeAll(" /Decode [1 0 1 0 1 0 1 0]");
+            if (mask_ids[i] != 0) try w.print(" /SMask {d} 0 R", .{mask_ids[i]});
+            try w.print(" /Length {d} >>\nstream\n", .{img.data.len});
+            try w.writeAll(img.data);
+            try w.writeAll("\nendstream\nendobj\n");
+            if (img.alpha) |alpha| {
+                offsets[mask_ids[i]] = out.written().len;
+                try w.print("{d} 0 obj\n<< /Type /XObject /Subtype /Image /Width {d} /Height {d} /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length {d} >>\nstream\n", .{ mask_ids[i], img.width, img.height, alpha.len });
+                try w.writeAll(alpha);
+                try w.writeAll("\nendstream\nendobj\n");
+            }
+        }
+
+        for (self.pages.items, 0..) |p, i| {
+            const raw = p.content.items;
+            const data = if (self.options.compress) try codec.zlibCompress(a, raw) else raw;
+            offsets[content_ids[i]] = out.written().len;
+            try w.print("{d} 0 obj\n<< /Length {d}{s} >>\nstream\n", .{ content_ids[i], data.len, if (self.options.compress) " /Filter /FlateDecode" else "" });
+            try w.writeAll(data);
+            try w.writeAll("\nendstream\nendobj\n");
+
+            offsets[page_ids[i]] = out.written().len;
+            try w.print("{d} 0 obj\n<< /Type /Page /Parent {d} 0 R /MediaBox [0 0 {d:.2} {d:.2}] /Contents {d} 0 R /Resources <<", .{ page_ids[i], pages_id, p.size.width, p.size.height, content_ids[i] });
+            if (self.fonts_used.count() > 0) {
+                try w.writeAll(" /Font <<");
+                it = self.fonts_used.iterator();
+                while (it.next()) |f| try w.print(" /F{d} {d} 0 R", .{ @backingInt(f), font_ids.get(f) });
+                try w.writeAll(" >>");
+            }
+            if (self.images.items.len > 0) {
+                try w.writeAll(" /XObject <<");
+                for (image_ids, 0..) |id, n| try w.print(" /Im{d} {d} 0 R", .{ n, id });
+                try w.writeAll(" >>");
+            }
+            try w.writeAll(" >>");
+            if (p.links.items.len > 0) {
+                try w.writeAll(" /Annots [");
+                for (0..p.links.items.len) |n| try w.print("{d} 0 R ", .{first_link_ids[i] + n});
+                try w.writeAll("]");
+            }
+            try w.writeAll(" >>\nendobj\n");
+
+            for (p.links.items, 0..) |l, n| {
+                offsets[first_link_ids[i] + n] = out.written().len;
+                try w.print("{d} 0 obj\n<< /Type /Annot /Subtype /Link /Rect [{d:.2} {d:.2} {d:.2} {d:.2}] /Border [0 0 0] /A << /S /URI /URI ", .{ first_link_ids[i] + n, l.rect[0], l.rect[1], l.rect[2], l.rect[3] });
+                try writeLiteralTo(w, l.url);
+                try w.writeAll(" >> >>\nendobj\n");
+            }
+        }
+
+        const xref = out.written().len;
+        try w.print("xref\n0 {d}\n0000000000 65535 f \n", .{object_count + 1});
+        for (offsets[1..]) |off| try w.print("{d:0>10} 00000 n \n", .{off});
+        try w.print("trailer\n<< /Size {d} /Root {d} 0 R /Info {d} 0 R >>\nstartxref\n{d}\n%%EOF\n", .{ object_count + 1, catalog_id, info_id, xref });
+    }
+};
+
+/// A PDF literal string: `(...)` with `(`, `)` and `\` escaped and the
+/// line-break bytes written as escapes, so the string stays on one line.
+fn writeLiteral(allocator: std.mem.Allocator, out: *std.ArrayList(u8), bytes: []const u8) !void {
+    try out.append(allocator, '(');
+    for (bytes) |b| switch (b) {
+        '(', ')', '\\' => {
+            try out.append(allocator, '\\');
+            try out.append(allocator, b);
+        },
+        '\r' => try out.appendSlice(allocator, "\\r"),
+        '\n' => try out.appendSlice(allocator, "\\n"),
+        else => try out.append(allocator, b),
+    };
+    try out.append(allocator, ')');
+}
+
+fn writeLiteralTo(w: *std.Io.Writer, bytes: []const u8) !void {
+    try w.writeByte('(');
+    for (bytes) |b| switch (b) {
+        '(', ')', '\\' => {
+            try w.writeByte('\\');
+            try w.writeByte(b);
+        },
+        '\r' => try w.writeAll("\\r"),
+        '\n' => try w.writeAll("\\n"),
+        else => try w.writeByte(b),
+    };
+    try w.writeByte(')');
+}
+
+/// A PDF text string for the document properties: plain ASCII as a
+/// literal; anything else as UTF-16BE with a byte order mark, in hex, which
+/// every reader shows with its accents.
+fn writeTextString(w: *std.Io.Writer, utf8: []const u8) !void {
+    for (utf8) |b| {
+        if (b < 0x20 or b > 0x7E) break;
+    } else return writeLiteralTo(w, utf8);
+
+    try w.writeAll("<FEFF");
+    var i: usize = 0;
+    while (i < utf8.len) {
+        const len = std.unicode.utf8ByteSequenceLength(utf8[i]) catch 1;
+        const cp: u21 = if (i + len <= utf8.len) std.unicode.utf8Decode(utf8[i .. i + len]) catch 0xFFFD else 0xFFFD;
+        i += len;
+        if (cp >= 0x10000) {
+            const v = cp - 0x10000;
+            try w.print("{X:0>4}{X:0>4}", .{ 0xD800 + (v >> 10), 0xDC00 + (v & 0x3FF) });
+        } else {
+            try w.print("{X:0>4}", .{cp});
+        }
+    }
+    try w.writeByte('>');
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+const t = std.testing;
+
+fn render(doc: *Document) ![]u8 {
+    return doc.toBytes(t.allocator);
+}
+
+/// Every xref entry must point at the start of its "N 0 obj": the check a
+/// reader does first, and the one a hand-built PDF gets wrong most.
+fn expectValidXref(pdf: []const u8) !void {
+    try t.expect(std.mem.startsWith(u8, pdf, "%PDF-1.4\n"));
+    try t.expect(std.mem.endsWith(u8, pdf, "%%EOF\n"));
+    const sx = std.mem.lastIndexOf(u8, pdf, "startxref\n").?;
+    const xref_at = try std.fmt.parseInt(usize, std.mem.trim(u8, pdf[sx + 10 .. pdf.len - 6], "\n"), 10);
+    try t.expect(std.mem.startsWith(u8, pdf[xref_at..], "xref\n0 "));
+    var lines = std.mem.splitScalar(u8, pdf[xref_at..], '\n');
+    _ = lines.next();
+    const header = lines.next().?;
+    const count = try std.fmt.parseInt(usize, header[2..], 10);
+    _ = lines.next(); // the free entry
+    for (1..count) |id| {
+        const entry = lines.next().?;
+        try t.expectEqual(@as(usize, 19), entry.len); // 20 bytes with the \n
+        const off = try std.fmt.parseInt(usize, entry[0..10], 10);
+        var buf: [32]u8 = undefined;
+        const want = try std.fmt.bufPrint(&buf, "{d} 0 obj\n", .{id});
+        try t.expect(std.mem.startsWith(u8, pdf[off..], want));
+    }
+}
+
+fn contains(haystack: []const u8, needle: []const u8) bool {
+    return std.mem.indexOf(u8, haystack, needle) != null;
+}
+
+test "an empty document is a valid one-page PDF" {
+    var doc = try Document.init(t.allocator, .{});
+    defer doc.deinit();
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    try t.expect(contains(pdf, "/Count 1"));
+    try t.expect(contains(pdf, "/MediaBox [0 0 595.28 841.89]"));
+    try t.expect(!contains(pdf, "/Font"));
+}
+
+test "text is written in WinAnsi at PDF coordinates, with its font declared" {
+    var doc = try Document.init(t.allocator, .{ .compress = false });
+    defer doc.deinit();
+    try doc.text(50, 100, "Olá (1)", .{ .font = .helvetica_bold, .size = 12 });
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    // y 100 from the top of an 841.89-point page is 741.89 from the bottom.
+    try t.expect(contains(pdf, "BT /F1 12.00 Tf 0.000 0.000 0.000 rg 50.00 741.89 Td (Ol\xe1 \\(1\\)) Tj ET"));
+    try t.expect(contains(pdf, "/BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding"));
+    try t.expect(contains(pdf, "/Font << /F1 "));
+    try t.expect(!contains(pdf, "/BaseFont /Helvetica "));
+}
+
+test "aligned text is placed by its measured width" {
+    var doc = try Document.init(t.allocator, .{ .compress = false });
+    defer doc.deinit();
+    // "Hi" in Helvetica 10 is 9.44 points wide.
+    try doc.text(100, 10, "Hi", .{ .size = 10, .@"align" = .right });
+    try doc.text(100, 10, "Hi", .{ .size = 10, .@"align" = .center });
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try t.expect(contains(pdf, "90.56 831.89 Td"));
+    try t.expect(contains(pdf, "95.28 831.89 Td"));
+}
+
+test "page contents are compressed by default" {
+    var doc = try Document.init(t.allocator, .{});
+    defer doc.deinit();
+    try doc.text(10, 10, "compressed", .{});
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    try t.expect(contains(pdf, "/Filter /FlateDecode"));
+    try t.expect(!contains(pdf, "(compressed)"));
+    // The stream inflates back to the operators.
+    const start = std.mem.indexOf(u8, pdf, "/Filter /FlateDecode >>\nstream\n").? + "/Filter /FlateDecode >>\nstream\n".len;
+    const end = std.mem.indexOfPos(u8, pdf, start, "\nendstream").?;
+    const raw = try codec.zlibDecompress(t.allocator, pdf[start..end], 10_000);
+    defer t.allocator.free(raw);
+    try t.expect(contains(raw, "(compressed) Tj"));
+}
+
+test "textBox wraps, and returns the height of its lines" {
+    var doc = try Document.init(t.allocator, .{ .compress = false });
+    defer doc.deinit();
+    const h = try doc.textBox(40, 40, 60, "hello world again", .{ .font = .courier, .size = 10 });
+    // Courier 10: 6 points a character; 60 points hold "hello" and "world".
+    try t.expectApproxEqAbs(@as(f32, 3 * 12.5), h, 0.001);
+    try t.expectEqual(h, try doc.measureText("hello world again", 60, .{ .font = .courier, .size = 10 }));
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try t.expect(contains(pdf, "(hello) Tj"));
+    try t.expect(contains(pdf, "(world) Tj"));
+    try t.expect(contains(pdf, "(again) Tj"));
+}
+
+test "paragraph flows to new pages and moves the cursor" {
+    var doc = try Document.init(t.allocator, .{ .size = .{ .width = 200, .height = 200 }, .margin = 20 });
+    defer doc.deinit();
+    const start = doc.y;
+    try doc.paragraph("one line", .{ .size = 10 });
+    try t.expectApproxEqAbs(start + 12.5, doc.y, 0.001);
+    // 160 points of room at 12.5 a line: 12 lines a page.
+    var many: std.ArrayList(u8) = .empty;
+    defer many.deinit(t.allocator);
+    for (0..30) |_| try many.appendSlice(t.allocator, "line\n");
+    try doc.paragraph(many.items, .{ .size = 10 });
+    try t.expectEqual(@as(usize, 3), doc.pageCount());
+    try t.expect(doc.y <= doc.bottom());
+}
+
+test "setPage draws on an earlier page and refuses one that does not exist" {
+    var doc = try Document.init(t.allocator, .{ .compress = false });
+    defer doc.deinit();
+    try doc.addPage();
+    try doc.setPage(0);
+    try doc.text(10, 10, "back on page one", .{});
+    try t.expectError(Error.NoSuchPage, doc.setPage(2));
+    try t.expectEqual(@as(usize, 2), doc.pageCount());
+    try t.expect(contains(doc.pages.items[0].content.items, "back on page one"));
+    try t.expectEqual(@as(usize, 0), doc.pages.items[1].content.items.len);
+}
+
+test "shapes: fill, stroke, both, dashes and curves" {
+    var doc = try Document.init(t.allocator, .{ .compress = false, .size = .{ .width = 100, .height = 100 } });
+    defer doc.deinit();
+    try doc.rect(10, 10, 20, 30, .{});
+    try doc.rect(10, 10, 20, 30, .{ .fill = Color.hex("#ff0000") });
+    try doc.rect(10, 10, 20, 30, .{ .fill = Color.white, .stroke = Color.black, .radius = 4 });
+    try doc.line(0, 0, 100, 100, .{ .width = 0.5, .dash = .{ 3, 2 } });
+    try doc.circle(50, 50, 10, .{ .fill = Color.black });
+    const c = doc.pages.items[0].content.items;
+    try t.expect(contains(c, "10.00 60.00 20.00 30.00 re S Q")); // outline by default
+    try t.expect(contains(c, "1.000 0.000 0.000 rg 0.000 0.000 0.000 RG 10.00 60.00 20.00 30.00 re f Q"));
+    try t.expect(contains(c, " c h B Q")); // rounded and filled+stroked
+    try t.expect(contains(c, "q 0.50 w [3.00 2.00] 0 d"));
+    try t.expect(contains(c, "0.00 100.00 m 100.00 0.00 l S Q"));
+    try t.expect(contains(c, "60.00 50.00 m ")); // circle starts at its right end
+}
+
+test "images: stored once, drawn with their proportions, with a soft mask for alpha" {
+    var doc = try Document.init(t.allocator, .{ .compress = false });
+    defer doc.deinit();
+    // A 2x1 RGBA PNG with a transparent pixel.
+    const rows = [_]u8{ 0, 255, 0, 0, 255, 0, 0, 255, 0 };
+    const png = try testPng(t.allocator, 2, 1, &rows);
+    defer t.allocator.free(png);
+    const a = try doc.addImage(png);
+    const b = try doc.addImage(png);
+    try t.expectEqual(a.index, b.index);
+    try doc.image(a, 10, 10, .{ .width = 100 });
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    try t.expect(contains(pdf, "q 100.00 0 0 50.00 10.00 781.89 cm /Im0 Do Q"));
+    try t.expect(contains(pdf, "/Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /SMask "));
+    try t.expect(contains(pdf, "/ColorSpace /DeviceGray"));
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, pdf, "/ColorSpace /DeviceRGB"));
+    try t.expectError(Error.UnknownImage, doc.image(.{ .index = 9, .width = 1, .height = 1 }, 0, 0, .{}));
+}
+
+fn testPng(allocator: std.mem.Allocator, width_px: u32, height_px: u32, rows: []const u8) ![]u8 {
+    const comp = try codec.zlibCompress(allocator, rows);
+    defer allocator.free(comp);
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(allocator, &.{ 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A });
+    var ihdr: [13]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 8, 6, 0, 0, 0 };
+    std.mem.writeInt(u32, ihdr[0..4], width_px, .big);
+    std.mem.writeInt(u32, ihdr[4..8], height_px, .big);
+    inline for (.{ .{ "IHDR", @as([]const u8, &ihdr) }, .{ "IDAT", @as([]const u8, comp) }, .{ "IEND", @as([]const u8, "") } }) |ch| {
+        var len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len, @intCast(ch[1].len), .big);
+        try out.appendSlice(allocator, &len);
+        try out.appendSlice(allocator, ch[0]);
+        try out.appendSlice(allocator, ch[1]);
+        try out.appendSlice(allocator, &.{ 0, 0, 0, 0 });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "links become URI annotations on their page" {
+    var doc = try Document.init(t.allocator, .{ .size = .{ .width = 100, .height = 100 } });
+    defer doc.deinit();
+    try doc.link(10, 20, 30, 10, "https://spiderme.org/docs?a=(1)");
+    try t.expectError(Error.InvalidUrl, doc.link(0, 0, 1, 1, "https://exemplo.com/ação"));
+    try t.expectError(Error.InvalidUrl, doc.link(0, 0, 1, 1, "https://a b"));
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    try t.expect(contains(pdf, "/Annots ["));
+    try t.expect(contains(pdf, "/Rect [10.00 70.00 40.00 80.00]"));
+    try t.expect(contains(pdf, "/URI (https://spiderme.org/docs?a=\\(1\\))"));
+}
+
+test "document properties: ASCII as literals, accents as UTF-16" {
+    var doc = try Document.init(t.allocator, .{ .info = .{ .title = "Invoice", .author = "José" } });
+    defer doc.deinit();
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    try t.expect(contains(pdf, "/Producer (Spider PDF)"));
+    try t.expect(contains(pdf, "/Title (Invoice)"));
+    try t.expect(contains(pdf, "/Author <FEFF004A006F007300E9>"));
+    try t.expect(contains(pdf, "/Info 3 0 R"));
+}
+
+test "pages of different sizes keep their own MediaBox" {
+    var doc = try Document.init(t.allocator, .{});
+    defer doc.deinit();
+    try doc.addPageSized(Size.a4.landscape());
+    const pdf = try render(&doc);
+    defer t.allocator.free(pdf);
+    try expectValidXref(pdf);
+    try t.expect(contains(pdf, "/MediaBox [0 0 595.28 841.89]"));
+    try t.expect(contains(pdf, "/MediaBox [0 0 841.89 595.28]"));
+    try t.expect(contains(pdf, "/Count 2"));
+}
+
+test "Color.hex reads #rrggbb" {
+    try t.expectEqual(Color{ .r = 0x12, .g = 0xab, .b = 0xff }, Color.hex("#12abff"));
+    try t.expectEqual(Color.hex("#000000"), Color.hex("000000"));
+}
+
+test "line breaks in a literal string are escaped" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(t.allocator);
+    try writeLiteral(t.allocator, &list, "a\\b\r\n(c)");
+    try t.expectEqualStrings("(a\\\\b\\r\\n\\(c\\))", list.items);
+}

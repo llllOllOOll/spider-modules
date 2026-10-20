@@ -16,6 +16,7 @@ packages that plug into a Spider app through the module contract
 | Module | What it does | Spider |
 |---|---|---|
 | [`notify`](notify/) | Multi-channel notifications: transactional outbox, inbox, SSE, Web Push, FCM, email, retries and deduplication | `>=0.11.0-dev.1 <0.12.0` |
+| [`pdf`](pdf/) | PDF documents: text, wrapped paragraphs, tables over pages, shapes, PNG/JPEG images, links; std only | `>=0.11.0 <0.12.0` |
 
 ## Using a module
 
@@ -65,6 +66,7 @@ given with `--fork` (a path relative to this repository):
 zig build test                    # unit tests, against the pinned Spider
 zig build test --fork=../spider   # the same, against a checkout
 notify/scripts/test-db.sh         # notify on a disposable Postgres (Docker)
+pdf/scripts/check.sh              # pdf's sample document through qpdf and pdftotext
 scripts/ecosystem.sh              # everything against ../spider (SPIDER_DIR), as the release gate runs it
 ```
 

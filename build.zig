@@ -51,6 +51,33 @@ pub fn build(b: *std.Build) void {
     const notify_db_step = b.step("test-notify-db", "notify: module and database tests");
     notify_db_step.dependOn(&notify_db_test.step);
     test_db_step.dependOn(&notify_db_test.step);
+
+    // ── pdf ─────────────────────────────────────────────────────────────
+    const pdf_mod = b.createModule(.{
+        .root_source_file = b.path("pdf/src/pdf.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "spider", .module = spider_mod }},
+    });
+    const pdf_unit = b.addRunArtifact(b.addTest(.{ .root_module = pdf_mod }));
+    test_step.dependOn(&pdf_unit.step);
+    b.step("test-pdf", "pdf: unit tests").dependOn(&pdf_unit.step);
+
+    // A sample document with every feature, for PDF readers and validators
+    // (pdf/scripts/check.sh runs qpdf --check and pdftotext on it).
+    const pdf_sample = b.addExecutable(.{
+        .name = "pdf-sample",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pdf/examples/sample.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "spider_pdf", .module = pdf_mod }},
+        }),
+    });
+    const run_sample = b.addRunArtifact(pdf_sample);
+    const sample_pdf = run_sample.addOutputFileArg("pdf-sample.pdf");
+    const install_sample = b.addInstallFile(sample_pdf, "pdf-sample.pdf");
+    b.step("pdf-sample", "pdf: write zig-out/pdf-sample.pdf").dependOn(&install_sample.step);
 }
 
 fn dbTest(
