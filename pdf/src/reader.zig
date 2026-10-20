@@ -11,11 +11,14 @@
 //! or edited by hand, the file is scanned for `N G obj` and the objects are
 //! read from where they really are, the way PDF readers repair a file.
 //!
-//! Encrypted files are refused (`error.EncryptedPdf`).
+//! Encrypted files are decrypted when they open with the password given
+//! (usually none: see crypt.zig); otherwise `error.EncryptedPdf` (a
+//! password is needed) or `error.WrongPassword`.
 
 const std = @import("std");
 const syntax = @import("syntax.zig");
 const filters = @import("filters.zig");
+const crypt = @import("crypt.zig");
 
 const Object = syntax.Object;
 const Dict = syntax.Dict;
@@ -24,8 +27,12 @@ const Ref = syntax.Ref;
 pub const Error = error{
     /// Not a PDF, or damaged beyond repair.
     InvalidPdf,
-    /// The file is encrypted (password protected, or with permissions).
+    /// The file is encrypted and needs a password.
     EncryptedPdf,
+    /// The password given opens neither as user nor as owner.
+    WrongPassword,
+    /// An encryption scheme this reader does not handle (public-key).
+    UnsupportedEncryption,
     UnsupportedFilter,
     OutOfMemory,
 };
@@ -49,6 +56,10 @@ pub const File = struct {
     trailer: Dict,
     /// The file was repaired: its cross-reference data could not be used.
     repaired: bool = false,
+    /// The file was encrypted (and has been decrypted).
+    encrypted: bool = false,
+    /// The permission flags of an encrypted file (/P).
+    permissions: ?i32 = null,
 
     pub fn get(self: *const File, num: u32) ?Object {
         if (num >= self.objects.len) return null;
@@ -65,9 +76,11 @@ pub const File = struct {
     }
 };
 
-/// Reads every object of `data`, in `arena`. Strings and stream data
-/// point into `data` or the arena: both must outlive the result.
-pub fn load(arena: std.mem.Allocator, data: []const u8) Error!File {
+/// Reads every object of `data`, in `arena`, decrypting an encrypted file
+/// with `password` (empty for the usual files that open without one).
+/// Strings and stream data point into `data` or the arena: both must
+/// outlive the result.
+pub fn load(arena: std.mem.Allocator, data: []const u8, password: []const u8) Error!File {
     // A missing "%PDF-" header is tolerated, as readers do: the objects
     // decide whether this is a PDF.
 
@@ -83,19 +96,17 @@ pub fn load(arena: std.mem.Allocator, data: []const u8) Error!File {
 
     var file: File = undefined;
     if (trailer) |tr| {
-        if (readObjects(arena, data, &xref, tr)) |f| {
+        if (readObjects(arena, data, &xref, tr, password)) |f| {
             file = f;
         } else |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.EncryptedPdf => return error.EncryptedPdf,
+            error.OutOfMemory, error.EncryptedPdf, error.WrongPassword, error.UnsupportedEncryption => |e| return e,
             else => trailer = null,
         }
     }
     if (trailer == null) {
-        file = try reconstruct(arena, data);
+        file = try reconstruct(arena, data, password);
         repaired = true;
     }
-    if (file.trailer.get("Encrypt") != null) return Error.EncryptedPdf;
     if (file.resolve(file.trailer.get("Root") orelse return Error.InvalidPdf) != .dict) return Error.InvalidPdf;
     file.repaired = repaired;
     return file;
@@ -234,8 +245,7 @@ const LoadContext = struct {
     }
 };
 
-fn readObjects(arena: std.mem.Allocator, data: []const u8, xref: *std.AutoHashMap(u32, XrefEntry), trailer: Dict) Error!File {
-    if (trailer.get("Encrypt") != null) return Error.EncryptedPdf;
+fn readObjects(arena: std.mem.Allocator, data: []const u8, xref: *std.AutoHashMap(u32, XrefEntry), trailer: Dict, password: []const u8) Error!File {
     var max: u32 = 0;
     var it = xref.keyIterator();
     while (it.next()) |k| max = @max(max, k.*);
@@ -245,6 +255,8 @@ fn readObjects(arena: std.mem.Allocator, data: []const u8, xref: *std.AutoHashMa
     if (max > max_objects) return Error.InvalidPdf;
     const objects = try arena.alloc(?Object, @as(usize, max) + 1);
     @memset(objects, null);
+    const gens = try arena.alloc(u16, objects.len);
+    @memset(gens, 0);
 
     var ctx: LoadContext = .{ .arena = arena, .data = data, .xref = xref };
     var streams: std.AutoHashMap(u32, ObjStm) = .init(arena);
@@ -260,10 +272,13 @@ fn readObjects(arena: std.mem.Allocator, data: []const u8, xref: *std.AutoHashMa
                 // An offset pointing at another object means a stale table.
                 if (r.ref.num != e.key_ptr.*) return Error.InvalidPdf;
                 objects[r.ref.num] = r.object;
+                gens[r.ref.num] = r.ref.gen;
             },
             .compressed => {},
         }
     }
+    // Before the object streams: they are encrypted too.
+    const permissions = try decryptAll(arena, objects, gens, trailer, password);
     entries = xref.iterator();
     while (entries.next()) |e| {
         switch (e.value_ptr.*) {
@@ -274,7 +289,67 @@ fn readObjects(arena: std.mem.Allocator, data: []const u8, xref: *std.AutoHashMa
             else => {},
         }
     }
-    return .{ .objects = objects, .trailer = trailer };
+    return .{ .objects = objects, .trailer = trailer, .encrypted = permissions != null, .permissions = permissions };
+}
+
+/// Decrypts the objects of an encrypted file in place (all but the
+/// /Encrypt dictionary itself) and returns its permissions; null when the
+/// file is not encrypted.
+fn decryptAll(arena: std.mem.Allocator, objects: []?Object, gens: []const u16, trailer: Dict, password: []const u8) Error!?i32 {
+    const enc_obj = trailer.get("Encrypt") orelse return null;
+    var enc_num: ?u32 = null;
+    const enc = switch (enc_obj) {
+        .dict => |d| d,
+        .ref => |r| blk: {
+            enc_num = r.num;
+            const o = (if (r.num < objects.len) objects[r.num] else null) orelse return Error.InvalidPdf;
+            break :blk o.dictionary() orelse return Error.InvalidPdf;
+        },
+        else => return Error.InvalidPdf,
+    };
+    // Values of /Encrypt may be references (/CF 7 0 R): resolved here, so
+    // the security handler sees plain values.
+    const enc_direct = (try inlineRefs(arena, objects, .{ .dict = enc }, 0)).dict;
+    var id0: []const u8 = "";
+    if (trailer.get("ID")) |id| {
+        if (id == .array and id.array.len > 0 and id.array[0] == .string) id0 = id.array[0].string;
+    }
+    const dec = crypt.Decryptor.init(enc_direct, id0, password) catch |err| return switch (err) {
+        error.EncryptedPdf => Error.EncryptedPdf,
+        error.WrongPassword => Error.WrongPassword,
+        error.UnsupportedEncryption => Error.UnsupportedEncryption,
+        error.OutOfMemory => Error.OutOfMemory,
+        error.InvalidPdf => Error.InvalidPdf,
+    };
+    for (objects, 0..) |*slot, num| {
+        if (enc_num != null and num == enc_num.?) continue;
+        const obj = slot.* orelse continue;
+        slot.* = dec.decryptObject(arena, .{ .num = @intCast(num), .gen = gens[num] }, obj) catch |err| return switch (err) {
+            error.OutOfMemory => Error.OutOfMemory,
+            else => Error.InvalidPdf,
+        };
+    }
+    return dec.permissions;
+}
+
+/// `obj` with its references replaced by the objects they point to, a few
+/// levels deep (enough for an /Encrypt dictionary and its crypt filters).
+fn inlineRefs(arena: std.mem.Allocator, objects: []?Object, obj: Object, depth: usize) Error!Object {
+    if (depth > 4) return obj;
+    return switch (obj) {
+        .ref => |r| if (r.num < objects.len) (if (objects[r.num]) |o| try inlineRefs(arena, objects, o, depth + 1) else .null) else .null,
+        .dict => |d| blk: {
+            const entries = try arena.alloc(syntax.Entry, d.entries.len);
+            for (d.entries, entries) |e, *o| o.* = .{ .key = e.key, .value = try inlineRefs(arena, objects, e.value, depth + 1) };
+            break :blk .{ .dict = .{ .entries = entries } };
+        },
+        .array => |items| blk: {
+            const out = try arena.alloc(Object, items.len);
+            for (items, out) |i, *o| o.* = try inlineRefs(arena, objects, i, depth + 1);
+            break :blk .{ .array = out };
+        },
+        else => obj,
+    };
 }
 
 /// A decoded object stream: `/N` objects after a header of number/offset
@@ -332,8 +407,9 @@ fn objectStream(arena: std.mem.Allocator, objects: []?Object, cache: *std.AutoHa
 /// later updates come later), then the objects of the object streams found,
 /// and a trailer from the last `trailer` dictionary or cross-reference
 /// stream, or one made up around the document catalog.
-fn reconstruct(arena: std.mem.Allocator, data: []const u8) Error!File {
+fn reconstruct(arena: std.mem.Allocator, data: []const u8, password: []const u8) Error!File {
     var found: std.AutoHashMap(u32, Object) = .init(arena);
+    var found_gens: std.AutoHashMap(u32, u16) = .init(arena);
     var max: u32 = 0;
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, data, i, "obj")) |at| {
@@ -354,6 +430,7 @@ fn reconstruct(arena: std.mem.Allocator, data: []const u8) Error!File {
         const r = p.indirect() catch continue;
         if (r.ref.num > max_objects) continue; // an impossibly large number
         try found.put(r.ref.num, r.object);
+        try found_gens.put(r.ref.num, r.ref.gen);
         max = @max(max, r.ref.num);
         i = p.pos;
     }
@@ -361,8 +438,30 @@ fn reconstruct(arena: std.mem.Allocator, data: []const u8) Error!File {
 
     const objects = try arena.alloc(?Object, @as(usize, max) + 1);
     @memset(objects, null);
+    const gens = try arena.alloc(u16, objects.len);
+    @memset(gens, 0);
     var it = found.iterator();
-    while (it.next()) |e| objects[e.key_ptr.*] = e.value_ptr.*;
+    while (it.next()) |e| {
+        objects[e.key_ptr.*] = e.value_ptr.*;
+        gens[e.key_ptr.*] = found_gens.get(e.key_ptr.*) orelse 0;
+    }
+    // The trailer, early: an encrypted file is decrypted before its object
+    // streams are opened.
+    var early_trailer: ?Dict = null;
+    if (std.mem.lastIndexOf(u8, data, "trailer")) |at| {
+        var tp = syntax.Parser.init(arena, data, at + "trailer".len);
+        if (tp.object()) |tr| {
+            if (tr == .dict) early_trailer = tr.dict;
+        } else |_| {}
+    }
+    if (early_trailer == null) {
+        for (objects) |o| {
+            const obj = o orelse continue;
+            if (obj == .stream and obj.stream.dict.hasName("Type", "XRef") and obj.stream.dict.get("Encrypt") != null) early_trailer = obj.stream.dict;
+        }
+    }
+    var permissions: ?i32 = null;
+    if (early_trailer) |tr| permissions = try decryptAll(arena, objects, gens, tr, password);
 
     // Objects packed in object streams (they have no "obj" of their own).
     var streams: std.AutoHashMap(u32, ObjStm) = .init(arena);
@@ -399,7 +498,7 @@ fn reconstruct(arena: std.mem.Allocator, data: []const u8) Error!File {
             }
         } else return Error.InvalidPdf;
     }
-    return .{ .objects = objects, .trailer = tr, .repaired = true };
+    return .{ .objects = objects, .trailer = tr, .repaired = true, .encrypted = permissions != null, .permissions = permissions };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -438,7 +537,7 @@ test "a classic xref table, with a stream whose Length is a reference" {
     bodies[3] = "<< /Length 5 0 R >>\nstream\nBT ET\nendstream";
     const all = bodies ++ [_][]const u8{"5"};
     const pdf = try classicPdf(arena.allocator(), &all, "");
-    const f = try load(arena.allocator(), pdf);
+    const f = try load(arena.allocator(), pdf, "");
     try t.expect(!f.repaired);
     try t.expect(f.get(1).?.dict.get("Type").?.isName("Catalog"));
     try t.expectEqualStrings("BT ET", f.get(4).?.stream.data);
@@ -457,7 +556,7 @@ test "an incremental update: the newer section wins, the older still counts" {
     try out.appendSlice(a, "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R >>\nendobj\n");
     const xref2 = out.items.len;
     try out.print(a, "xref\n3 1\n{d:0>10} 00000 n \ntrailer\n<< /Size 5 /Root 1 0 R /Prev {d} >>\nstartxref\n{d}\n%%EOF\n", .{ new_obj, first_xref, xref2 });
-    const f = try load(a, out.items);
+    const f = try load(a, out.items, "");
     try t.expect(!f.repaired);
     const box = f.get(3).?.dict.get("MediaBox").?.array;
     try t.expectEqual(@as(i64, 300), box[2].integer);
@@ -505,7 +604,7 @@ test "a cross-reference stream with a PNG predictor, and an object stream" {
     try out.appendSlice(a, z.written());
     try out.print(a, "\nendstream\nendobj\nstartxref\n{d}\n%%EOF\n", .{off5});
 
-    const f = try load(a, out.items);
+    const f = try load(a, out.items, "");
     try t.expect(!f.repaired);
     try t.expect(f.get(2).?.dict.get("Type").?.isName("Pages"));
     try t.expect(f.get(3).?.dict.get("Type").?.isName("Page"));
@@ -519,13 +618,13 @@ test "a file with a broken xref is repaired by scanning for objects" {
     const good = try classicPdf(a, &minimal, "");
     // Shift every object by inserting junk after the header: the table is stale.
     const broken = try std.mem.concat(a, u8, &.{ good[0..9], "% junk junk junk\n", good[9..] });
-    const f = try load(a, broken);
+    const f = try load(a, broken, "");
     try t.expect(f.repaired);
     try t.expect(f.get(3).?.dict.get("Type").?.isName("Page"));
 
     // No xref or trailer at all: the catalog is found by its type.
     const cut = good[0..std.mem.indexOf(u8, good, "xref\n").?];
-    const g = try load(a, cut);
+    const g = try load(a, cut, "");
     try t.expect(g.repaired);
     try t.expectEqual(@as(u32, 1), g.trailer.get("Root").?.ref.num);
 }
@@ -550,10 +649,10 @@ test "a file without its %PDF- header, and an impossibly large object number" {
     defer arena.deinit();
     const a = arena.allocator();
     const good = try classicPdf(a, &minimal, "");
-    const f = try load(a, good[9..]);
+    const f = try load(a, good[9..], "");
     try t.expect(f.get(3) != null);
     const huge = try std.mem.concat(a, u8, &.{ good[0..std.mem.indexOf(u8, good, "xref\n").?], "2147483647 0 obj << /Root 1 0 R >> endobj\n" });
-    const g = try load(a, huge);
+    const g = try load(a, huge, "");
     try t.expect(g.objects.len < 100);
 }
 
@@ -561,18 +660,35 @@ test "encrypted files and non-PDFs are refused" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const enc = try classicPdf(a, &minimal, "/Encrypt << /Filter /Standard >> ");
-    try t.expectError(Error.EncryptedPdf, load(a, enc));
-    try t.expectError(Error.InvalidPdf, load(a, "hello"));
-    try t.expectError(Error.InvalidPdf, load(a, "%PDF-1.4\nnothing here\n"));
-    try t.expectError(Error.InvalidPdf, load(a, ""));
+    const enc = try classicPdf(a, &minimal, "/Encrypt << /Filter /Adobe.PubSec /V 4 /R 4 >> ");
+    try t.expectError(Error.UnsupportedEncryption, load(a, enc, ""));
+    try t.expectError(Error.InvalidPdf, load(a, "hello", ""));
+    try t.expectError(Error.InvalidPdf, load(a, "%PDF-1.4\nnothing here\n", ""));
+    try t.expectError(Error.InvalidPdf, load(a, "", ""));
+}
+
+test "inlineRefs replaces references inside a dictionary (an /Encrypt with /CF 7 0 R)" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var p = syntax.Parser.init(a, "<< /CF 1 0 R /V 5 >>", 0);
+    const enc = try p.object();
+    var q = syntax.Parser.init(a, "<< /StdCF << /CFM /AESV3 >> >>", 0);
+    var objects = [_]?Object{ null, try q.object() };
+    const out = try inlineRefs(a, &objects, enc, 0);
+    const cf = out.dict.get("CF").?;
+    try t.expect(cf == .dict);
+    try t.expect(cf.dict.get("StdCF").?.dict.hasName("CFM", "AESV3"));
+    // A reference to a missing object becomes null.
+    var r = syntax.Parser.init(a, "[9 0 R]", 0);
+    try t.expect((try inlineRefs(a, &objects, try r.object(), 0)).array[0] == .null);
 }
 
 test "resolve follows references and gives null for missing objects" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const pdf = try classicPdf(arena.allocator(), &minimal, "");
-    const f = try load(arena.allocator(), pdf);
+    const f = try load(arena.allocator(), pdf, "");
     try t.expect(f.resolve(.{ .ref = .{ .num = 2 } }) == .dict);
     try t.expect(f.resolve(.{ .ref = .{ .num = 99 } }) == .null);
     try t.expectEqual(@as(i64, 7), f.resolve(.{ .integer = 7 }).integer);

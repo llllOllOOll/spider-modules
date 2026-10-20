@@ -10,16 +10,20 @@
 //! a single flat page tree, so pages that were removed take their content
 //! with them.
 //!
-//! Not supported: encrypted files (`error.EncryptedPdf`), signing (a save
-//! rewrites the file, so it would break an existing signature), and
-//! generating form field appearances: a filled text field asks the reader
-//! to draw it (`/NeedAppearances`), which Acrobat, browsers and Preview do.
+//! Encrypted files open when their user password is empty (the usual
+//! "protected" PDF) or with `loadWith(.{ .password = ... })`, user or owner
+//! password; they are saved decrypted. Their permissions are reported by
+//! `allows`, for the application to honor.
+//!
+//! Not supported: public-key encryption, and signing (a save rewrites the
+//! file, so it would break an existing signature).
 
 const std = @import("std");
 const syntax = @import("syntax.zig");
 const reader = @import("reader.zig");
 const filters = @import("filters.zig");
 const document = @import("document.zig");
+const fonts = @import("fonts.zig");
 
 const Object = syntax.Object;
 const Dict = syntax.Dict;
@@ -44,6 +48,24 @@ pub const Properties = struct {
     keywords: ?[]const u8 = null,
     creator: ?[]const u8 = null,
     producer: ?[]const u8 = null,
+};
+
+pub const LoadOptions = struct {
+    /// The user or the owner password; empty opens files that need none.
+    password: []const u8 = "",
+};
+
+/// What an encrypted file's author allows (its /P flags). A file that is
+/// not encrypted allows everything.
+pub const Permission = enum(u5) {
+    print = 3,
+    modify = 4,
+    copy = 5,
+    annotate = 6,
+    fill_forms = 9,
+    extract_for_accessibility = 10,
+    assemble = 11,
+    print_high_quality = 12,
 };
 
 pub const FieldKind = enum { text, checkbox, radio, button, choice, signature, unknown };
@@ -74,6 +96,10 @@ pub const Editor = struct {
     /// The file needed repair to be read (its cross-reference data was
     /// wrong or missing).
     repaired: bool = false,
+    /// The file was encrypted: it was decrypted on load and saves without
+    /// encryption.
+    encrypted: bool = false,
+    permissions: ?i32 = null,
     stamps: u32 = 0,
 
     /// Reads a PDF file. `bytes` must outlive the editor: stream data
@@ -88,12 +114,19 @@ pub const Editor = struct {
     /// defer allocator.free(out);
     /// ```
     pub fn load(allocator: std.mem.Allocator, bytes: []const u8) !Editor {
+        return loadWith(allocator, bytes, .{});
+    }
+
+    /// `load` with options: the password of an encrypted file.
+    pub fn loadWith(allocator: std.mem.Allocator, bytes: []const u8, options: LoadOptions) !Editor {
         var ed: Editor = .{ .arena = .init(allocator), .tree = undefined };
         errdefer ed.arena.deinit();
         const a = ed.arena.allocator();
         ed.tree = .init(a);
-        const file = try reader.load(a, bytes);
+        const file = try reader.load(a, bytes, options.password);
         ed.repaired = file.repaired;
+        ed.encrypted = file.encrypted;
+        ed.permissions = file.permissions;
         try ed.objects.appendSlice(a, file.objects);
         if (ed.objects.items.len == 0) try ed.objects.append(a, null); // object 0 is never used
 
@@ -115,6 +148,13 @@ pub const Editor = struct {
 
     pub fn deinit(self: *Editor) void {
         self.arena.deinit();
+    }
+
+    /// Whether the file's author allows `p` (always true for a file that is
+    /// not encrypted). Not enforced by the editor: the application decides.
+    pub fn allows(self: *const Editor, p: Permission) bool {
+        const flags = self.permissions orelse return true;
+        return flags & (@as(i32, 1) << (@backingInt(p) - 1)) != 0;
     }
 
     fn alloc(self: *Editor) std.mem.Allocator {
@@ -474,27 +514,212 @@ pub const Editor = struct {
         return Error.NoSuchField;
     }
 
-    /// Fills the text field `name` (its full name, `parent.child`). The
-    /// reader draws the new value: its old appearance is dropped and the
-    /// form asks for appearances to be made (`NeedAppearances`).
+    /// Fills the text field `name` (its full name, `parent.child`) and
+    /// draws its new appearance in each of its boxes, the way Acrobat does:
+    /// with the font, size and color of the field's default appearance
+    /// (`/DA`; size 0 fits the box), its alignment (`/Q`), and wrapped
+    /// lines in a multiline field. The form also asks readers to redraw
+    /// fields (`NeedAppearances`), which helps with characters the field's
+    /// font lacks.
     pub fn setText(self: *Editor, name: []const u8, value: []const u8) !void {
         const f = try self.findField(name);
         if (f.kind != .text) return Error.WrongFieldKind;
         const a = self.alloc();
         var d = try (self.resolve(.{ .ref = .{ .num = f.num } }).dictionary() orelse return Error.NoSuchField).clone(a);
         try d.put(a, "V", .{ .string = try encodeText(a, value) });
-        d.remove("AP");
+        self.objects.items[f.num] = .{ .dict = d };
+
+        // The widgets: the field itself when it has a box, or its kids.
+        var widgets: std.ArrayList(u32) = .empty;
+        if (d.get("Rect") != null) try widgets.append(a, f.num);
         if (d.get("Kids")) |kv| {
             const kids = self.resolve(kv);
             if (kids == .array) for (kids.array) |k| {
-                if (k != .ref) continue;
-                var w = try (self.resolve(k).dictionary() orelse continue).clone(a);
-                w.remove("AP");
-                self.objects.items[k.ref.num] = .{ .dict = w };
+                if (k == .ref) try widgets.append(a, k.ref.num);
             };
         }
-        self.objects.items[f.num] = .{ .dict = d };
+        for (widgets.items) |wn| {
+            var w = try (self.resolve(.{ .ref = .{ .num = wn } }).dictionary() orelse continue).clone(a);
+            const ap = try self.textAppearance(f.num, w, value);
+            var apd = Dict{};
+            try apd.put(a, "N", .{ .ref = .{ .num = ap } });
+            try w.put(a, "AP", .{ .dict = apd });
+            self.objects.items[wn] = .{ .dict = w };
+        }
         try self.needAppearances();
+    }
+
+    /// An inherited field attribute: on the widget, its field, the field's
+    /// parents, then (for /DA and /Q) the form.
+    fn inheritedAttr(self: *Editor, start: Dict, key: []const u8) ?Object {
+        var d = start;
+        var depth: usize = 0;
+        while (depth < 32) : (depth += 1) {
+            if (d.get(key)) |v| return self.resolve(v);
+            const parent = d.get("Parent") orelse break;
+            d = self.resolve(parent).dictionary() orelse break;
+        }
+        const form = self.acroForm() orelse return null;
+        return if (form.get(key)) |v| self.resolve(v) else null;
+    }
+
+    /// Draws `value` in a widget's box as a form XObject; returns its
+    /// object number.
+    fn textAppearance(self: *Editor, field_num: u32, widget: Dict, value: []const u8) !u32 {
+        const a = self.alloc();
+        const field = self.resolve(.{ .ref = .{ .num = field_num } }).dictionary() orelse Dict{};
+        // The box.
+        var box: [4]f64 = .{ 0, 0, 100, 20 };
+        if (self.resolve(widget.get("Rect") orelse .null) == .array) {
+            const r = self.resolve(widget.get("Rect").?).array;
+            if (r.len == 4) for (r, 0..) |n, i| {
+                box[i] = self.resolve(n).number() orelse 0;
+            };
+        }
+        const w: f32 = @floatCast(@abs(box[2] - box[0]));
+        const h: f32 = @floatCast(@abs(box[3] - box[1]));
+
+        // "/Helv 0 Tf 0 g": font name, size, and whatever sets the color.
+        const da = if (self.inheritedAttr(widget, "DA")) |v| (if (v == .string) v.string else "") else "";
+        const parsed = parseDa(da);
+        const font_name = parsed.font orelse "Helv";
+        const quadding = if (self.inheritedAttr(widget, "Q")) |v| (if (v == .integer) v.integer else 0) else 0;
+        const ff = if (self.inheritedAttr(field, "Ff")) |v| (if (v == .integer) v.integer else 0) else 0;
+        const multiline = ff & (1 << 12) != 0;
+
+        // The font: from the form's resources, or Helvetica added there.
+        const font_ref = try self.formFont(font_name);
+        const font_dict = self.resolve(.{ .ref = .{ .num = font_ref } }).dictionary() orelse Dict{};
+
+        var encoded: std.ArrayList(u8) = .empty;
+        try fonts.encode(a, &encoded, value);
+        const text = encoded.items;
+        const pad: f32 = 2;
+        var size: f32 = parsed.size;
+        if (size <= 0) {
+            size = if (multiline) 12 else @min(12, @max(4, (h - 2 * pad) * 0.7));
+            if (!multiline) {
+                while (size > 4 and self.widthIn(font_dict, text, size) > w - 2 * pad) size -= 0.5;
+            }
+        }
+
+        var content: std.ArrayList(u8) = .empty;
+        try content.print(a, "/Tx BMC\nq {d:.2} {d:.2} {d:.2} {d:.2} re W n\nBT /{s} {d:.2} Tf {s}\n", .{ pad / 2, pad / 2, w - pad, h - pad, font_name, size, parsed.color });
+        var lines: std.ArrayList([]const u8) = .empty;
+        if (multiline) {
+            try self.wrapIn(font_dict, text, size, w - 2 * pad, &lines);
+        } else {
+            for (text) |*b| if (b.* == '\n') {
+                b.* = ' ';
+            };
+            try lines.append(a, text);
+        }
+        const leading = size * 1.15;
+        for (lines.items, 0..) |line, i| {
+            const tw = self.widthIn(font_dict, line, size);
+            const x: f32 = switch (quadding) {
+                1 => (w - tw) / 2,
+                2 => w - pad - tw,
+                else => pad,
+            };
+            // Single line: centered vertically. Several: from the top.
+            const y: f32 = if (multiline) h - pad - size * 0.9 - @as(f32, @floatFromInt(i)) * leading else (h - size) / 2 + size * 0.22;
+            try content.print(a, "1 0 0 1 {d:.2} {d:.2} Tm ", .{ x, y });
+            try content.append(a, '(');
+            for (line) |b| {
+                if (b == '(' or b == ')' or b == '\\') try content.append(a, '\\');
+                try content.append(a, b);
+            }
+            try content.appendSlice(a, ") Tj\n");
+        }
+        try content.appendSlice(a, "ET\nQ\nEMC\n");
+
+        var form = Dict{};
+        try form.put(a, "Type", .{ .name = "XObject" });
+        try form.put(a, "Subtype", .{ .name = "Form" });
+        try form.put(a, "BBox", try numbers(a, &.{ 0, 0, w, h }));
+        var font_res = Dict{};
+        try font_res.put(a, font_name, .{ .ref = .{ .num = font_ref } });
+        var res = Dict{};
+        try res.put(a, "Font", .{ .dict = font_res });
+        try form.put(a, "Resources", .{ .dict = res });
+        return self.add(.{ .stream = .{ .dict = form, .data = content.items } });
+    }
+
+    /// The form's font named `name` (`/DR /Font`), or a Helvetica added to
+    /// the form's resources under that name.
+    fn formFont(self: *Editor, name: []const u8) !u32 {
+        const a = self.alloc();
+        if (self.acroForm()) |form| {
+            if (self.resolve(form.get("DR") orelse .null).dictionary()) |dr| {
+                if (self.resolve(dr.get("Font") orelse .null).dictionary()) |fd| {
+                    if (fd.get(name)) |f| return self.adopt(f);
+                }
+            }
+        }
+        var helv = Dict{};
+        try helv.put(a, "Type", .{ .name = "Font" });
+        try helv.put(a, "Subtype", .{ .name = "Type1" });
+        try helv.put(a, "BaseFont", .{ .name = "Helvetica" });
+        try helv.put(a, "Encoding", .{ .name = "WinAnsiEncoding" });
+        const num = try self.add(.{ .dict = helv });
+        // Recorded in the form's resources, so other fields find it too.
+        var catalog = try (self.resolve(.{ .ref = .{ .num = self.root } }).dictionary() orelse return num).clone(a);
+        const form_obj = catalog.get("AcroForm") orelse return num;
+        var form = try (self.resolve(form_obj).dictionary() orelse return num).clone(a);
+        var dr = if (self.resolve(form.get("DR") orelse .null).dictionary()) |x| try x.clone(a) else Dict{};
+        var fd = if (self.resolve(dr.get("Font") orelse .null).dictionary()) |x| try x.clone(a) else Dict{};
+        try fd.put(a, name, .{ .ref = .{ .num = num } });
+        try dr.put(a, "Font", .{ .dict = fd });
+        try form.put(a, "DR", .{ .dict = dr });
+        if (form_obj == .ref) {
+            self.objects.items[form_obj.ref.num] = .{ .dict = form };
+        } else {
+            try catalog.put(a, "AcroForm", .{ .dict = form });
+            self.objects.items[self.root] = .{ .dict = catalog };
+        }
+        return num;
+    }
+
+    /// The width of WinAnsi `text` in a simple font: its /Widths when it has
+    /// them, Helvetica's otherwise.
+    fn widthIn(self: *Editor, font: Dict, text: []const u8, size: f32) f32 {
+        const widths = self.resolve(font.get("Widths") orelse .null);
+        const first = if (self.resolve(font.get("FirstChar") orelse .null) == .integer) self.resolve(font.get("FirstChar").?).integer else 0;
+        const bold = if (self.resolve(font.get("BaseFont") orelse .null) == .name) std.mem.indexOf(u8, self.resolve(font.get("BaseFont").?).name, "Bold") != null else false;
+        var units: f32 = 0;
+        for (text) |b| {
+            if (widths == .array) {
+                const i = @as(i64, b) - first;
+                if (i >= 0 and i < widths.array.len) {
+                    units += @floatCast(self.resolve(widths.array[@intCast(i)]).number() orelse 500);
+                    continue;
+                }
+            }
+            units += @floatFromInt(fonts.charWidth(b, if (bold) .helvetica_bold else .helvetica));
+        }
+        return units / 1000 * size;
+    }
+
+    fn wrapIn(self: *Editor, font: Dict, text: []const u8, size: f32, max: f32, lines: *std.ArrayList([]const u8)) !void {
+        const a = self.alloc();
+        var paragraphs = std.mem.splitScalar(u8, text, '\n');
+        while (paragraphs.next()) |para| {
+            var start: usize = 0;
+            var last_fit: usize = 0;
+            var i: usize = 0;
+            while (i <= para.len) : (i += 1) {
+                if (i < para.len and para[i] != ' ') continue;
+                if (self.widthIn(font, para[start..i], size) <= max or last_fit == start) {
+                    last_fit = i;
+                } else {
+                    try lines.append(a, para[start..last_fit]);
+                    start = last_fit + 1;
+                    last_fit = i;
+                }
+            }
+            try lines.append(a, para[start..@min(last_fit, para.len)]);
+        }
     }
 
     /// Checks or unchecks the checkbox `name`.
@@ -705,6 +930,36 @@ const Copier = struct {
         return .{ .entries = entries };
     }
 };
+
+const Da = struct { font: ?[]const u8 = null, size: f32 = 0, color: []const u8 = "0 g" };
+
+/// Reads a default appearance string ("/Helv 12 Tf 0 0 1 rg"): the font,
+/// the size, and the operators that set the color.
+fn parseDa(da: []const u8) Da {
+    var out: Da = .{};
+    // The last few tokens and where each starts in `da`.
+    var tokens: [16][]const u8 = undefined;
+    var starts: [16]usize = undefined;
+    var n: usize = 0;
+    var it = std.mem.tokenizeAny(u8, da, " \t\r\n");
+    while (it.next()) |tok| {
+        if (n == tokens.len) {
+            std.mem.copyForwards([]const u8, tokens[0 .. n - 1], tokens[1..n]);
+            std.mem.copyForwards(usize, starts[0 .. n - 1], starts[1..n]);
+            n -= 1;
+        }
+        tokens[n] = tok;
+        starts[n] = it.index - tok.len;
+        n += 1;
+        if (std.mem.eql(u8, tok, "Tf") and n >= 3 and tokens[n - 3].len > 1 and tokens[n - 3][0] == '/') {
+            out.font = tokens[n - 3][1..];
+            out.size = std.fmt.parseFloat(f32, tokens[n - 2]) catch 0;
+        }
+        const want: usize = if (std.mem.eql(u8, tok, "g")) 1 else if (std.mem.eql(u8, tok, "rg")) 3 else if (std.mem.eql(u8, tok, "k")) 4 else 0;
+        if (want > 0 and n > want) out.color = da[starts[n - 1 - want] .. starts[n - 1] + tok.len];
+    }
+    return out;
+}
 
 fn numbers(a: std.mem.Allocator, values: []const f64) !Object {
     const items = try a.alloc(Object, values.len);
@@ -1042,15 +1297,130 @@ test "form fields: listed with full names, filled, checked, and saved" {
     try t.expectEqualStrings("Maria José", after[0].value.?);
     try t.expectEqualStrings("Goiânia", after[1].value.?);
     try t.expectEqualStrings("On", after[2].value.?);
-    // The filled field lost its old appearance; the form asks for new ones.
+    // The filled field has a new appearance with its value; the form asks
+    // readers to redraw too.
     const name_field = again.resolve(.{ .ref = .{ .num = after[0].num } }).dict;
-    try t.expect(name_field.get("AP") == null);
+    const ap = again.resolve(again.resolve(name_field.get("AP").?).dict.get("N").?).stream;
+    try t.expect(ap.dict.hasName("Subtype", "Form"));
+    try t.expect(contains(ap.data, "(Maria Jos\xe9) Tj"));
+    try t.expect(contains(ap.data, "/Helv "));
     const catalog = again.resolve(.{ .ref = .{ .num = again.root } }).dict;
     try t.expect(again.resolve(catalog.get("AcroForm").?).dict.get("NeedAppearances").?.boolean);
     // The checkbox widget shows the on state.
     const page = try again.pageDict(0);
     const annots = again.resolve(page.get("Annots").?).array;
     try t.expect(again.resolve(annots[2]).dict.get("AS").?.isName("On"));
+}
+
+test "encrypted files: every revision opens, decrypted, and saves in the clear" {
+    const fixtures = .{ "r2-rc4-40", "r3-rc4-128", "r4-rc4-128", "r4-aes-128", "r5-aes-256", "r6-aes-256" };
+    inline for (fixtures) |name| {
+        const bytes = @embedFile("testdata/" ++ name ++ ".pdf");
+        var ed = Editor.load(t.allocator, bytes) catch |err| {
+            std.debug.print("{s}: {s}\n", .{ name, @errorName(err) });
+            return err;
+        };
+        defer ed.deinit();
+        try t.expect(ed.encrypted);
+        try t.expectEqualStrings("Secret plan", (try ed.properties()).title.?);
+        try t.expectEqualStrings("José", (try ed.properties()).author.?);
+        try t.expect(contains(try pageText(&ed, 0), "(Encrypted hello) Tj"));
+        var again = try roundTrip(&ed);
+        defer again.deinit();
+        try t.expect(!again.encrypted);
+        try t.expect(contains(try pageText(&again, 0), "(Encrypted hello) Tj"));
+    }
+}
+
+test "encrypted files with a user password: user, owner, missing and wrong" {
+    inline for (.{ "r4-aes-128-sesame", "r6-aes-256-sesame" }) |name| {
+        const bytes = @embedFile("testdata/" ++ name ++ ".pdf");
+        try t.expectError(error.EncryptedPdf, Editor.load(t.allocator, bytes));
+        try t.expectError(error.WrongPassword, Editor.loadWith(t.allocator, bytes, .{ .password = "guess" }));
+        inline for (.{ "sesame", "owner" }) |pw| {
+            var ed = try Editor.loadWith(t.allocator, bytes, .{ .password = pw });
+            defer ed.deinit();
+            try t.expect(contains(try pageText(&ed, 0), "(Encrypted hello) Tj"));
+        }
+    }
+}
+
+test "permissions are reported" {
+    var ed = try Editor.load(t.allocator, @embedFile("testdata/r6-no-modify.pdf"));
+    defer ed.deinit();
+    try t.expect(!ed.allows(.modify));
+    try t.expect(!ed.allows(.print));
+    try t.expect(ed.allows(.copy));
+    var plain = try Editor.load(t.allocator, @embedFile("testdata/plain.pdf"));
+    defer plain.deinit();
+    try t.expect(!plain.encrypted);
+    try t.expect(plain.allows(.modify));
+}
+
+test "parseDa reads the font, the size and the color operators" {
+    const d = parseDa("/Helv 12 Tf 0 0 1 rg");
+    try t.expectEqualStrings("Helv", d.font.?);
+    try t.expectEqual(@as(f32, 12), d.size);
+    try t.expectEqualStrings("0 0 1 rg", d.color);
+    const auto = parseDa("0.5 g /TiRo 0 Tf");
+    try t.expectEqualStrings("TiRo", auto.font.?);
+    try t.expectEqual(@as(f32, 0), auto.size);
+    try t.expectEqualStrings("0.5 g", auto.color);
+    try t.expectEqualStrings("0 g", parseDa("").color);
+    // The same number as size and color: the color is the one before "g".
+    const same = parseDa("/Helv 0 Tf 0 g");
+    try t.expectEqualStrings("0 g", same.color);
+    try t.expectEqual(@as(f32, 0), same.size);
+}
+
+test "text appearances: auto size fits the box, alignment, multiline, the form's font" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bodies = [_][]const u8{
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R 5 0 R] /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 6 0 R >> >> >> >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 300] >>",
+        "<< /Type /Page /Parent 2 0 R /Annots [4 0 R 5 0 R] >>",
+        "<< /FT /Tx /T (short) /Q 2 /Subtype /Widget /Rect [10 10 60 30] >>",
+        "<< /FT /Tx /T (notes) /Ff 4096 /DA (/Cour 9 Tf 1 0 0 rg) /Subtype /Widget /Rect [10 40 110 100] >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    };
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, "%PDF-1.4\n");
+    var offsets: [bodies.len]usize = undefined;
+    for (bodies, 0..) |b, i| {
+        offsets[i] = out.items.len;
+        try out.print(a, "{d} 0 obj\n{s}\nendobj\n", .{ i + 1, b });
+    }
+    const xref = out.items.len;
+    try out.print(a, "xref\n0 {d}\n0000000000 65535 f \n", .{bodies.len + 1});
+    for (offsets) |o| try out.print(a, "{d:0>10} 00000 n \n", .{o});
+    try out.print(a, "trailer\n<< /Size {d} /Root 1 0 R >>\nstartxref\n{d}\n%%EOF\n", .{ bodies.len + 1, xref });
+
+    var ed = try Editor.load(t.allocator, out.items);
+    defer ed.deinit();
+    try ed.setText("short", "A longer value");
+    try ed.setText("notes", "First line that wraps inside the box\nSecond");
+    const short_ap = ed.resolve(ed.resolve(ed.resolve(.{ .ref = .{ .num = 4 } }).dict.get("AP").?).dict.get("N").?).stream;
+    // Auto size shrank until the text fits 50 - 4 points.
+    const tf = std.mem.indexOf(u8, short_ap.data, "/Helv ").?;
+    const size = try std.fmt.parseFloat(f32, std.mem.sliceTo(short_ap.data[tf + 6 ..], ' '));
+    try t.expect(size < 12);
+    try t.expect(ed.widthIn(ed.resolve(.{ .ref = .{ .num = 6 } }).dict, "A longer value", size) <= 46);
+    try t.expect(contains(short_ap.data, "re W n"));
+    // Right-aligned (/Q 2): the line ends 2 points from the right edge.
+    const tm = std.mem.indexOf(u8, short_ap.data, "1 0 0 1 ").? + 8;
+    const x = try std.fmt.parseFloat(f32, std.mem.sliceTo(short_ap.data[tm..], ' '));
+    try t.expectApproxEqAbs(@as(f32, 50 - 2) - ed.widthIn(ed.resolve(.{ .ref = .{ .num = 6 } }).dict, "A longer value", size), x, 0.01);
+    // Multiline: Courier added to the form's resources, red, several lines.
+    const notes_ap = ed.resolve(ed.resolve(ed.resolve(.{ .ref = .{ .num = 5 } }).dict.get("AP").?).dict.get("N").?).stream;
+    try t.expect(contains(notes_ap.data, "/Cour 9.00 Tf 1 0 0 rg"));
+    try t.expect(std.mem.count(u8, notes_ap.data, " Tj") >= 3);
+    try t.expect(contains(notes_ap.data, "(Second) Tj"));
+    const form = ed.acroForm().?;
+    try t.expect(ed.resolve(ed.resolve(form.get("DR").?).dict.get("Font").?).dict.get("Cour") != null);
+    var again = try roundTrip(&ed);
+    defer again.deinit();
 }
 
 test "text strings: UTF-16 with surrogates, PDFDocEncoding, and back" {

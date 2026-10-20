@@ -66,6 +66,8 @@ pub const ReadError = @import("reader.zig").Error;
 pub const Properties = editor.Properties;
 pub const Field = editor.Field;
 pub const FieldKind = editor.FieldKind;
+pub const LoadOptions = editor.LoadOptions;
+pub const Permission = editor.Permission;
 
 pub const spider_module = spider.module(.{
     .name = "pdf",
@@ -105,6 +107,7 @@ test {
     _ = @import("filters.zig");
     _ = @import("reader.zig");
     _ = @import("editor.zig");
+    _ = @import("crypt.zig");
 }
 
 test "the module manifest is pdf 0.1.0" {

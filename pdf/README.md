@@ -31,10 +31,14 @@ LibreOffice) and no dependency beyond `std`.
 - **Editing existing PDFs** (`Editor`): rotate, remove, reorder and copy
   pages between files (merge, split), stamp new content over a page (a
   watermark, "PAID", a signature image) with the same drawing API, read and
-  set the document properties, list and fill form fields (text,
+  set the document properties, list and fill form fields (text, with
+  their appearance drawn in the field's font, size and alignment; and
   checkboxes), save. Reads classic and stream cross-references, object
   streams and incremental updates, and repairs files whose
-  cross-reference data is broken.
+  cross-reference data is broken. Opens encrypted files (RC4 and AES-128
+  and 256, revisions 2 to 6) that need no password, which is most
+  "protected" PDFs, or with the user or owner password; they are saved
+  decrypted, and their permissions are reported (`ed.allows(.modify)`).
 
 Coordinates are points (1/72 inch) from the **top-left** corner.
 
@@ -109,6 +113,8 @@ Outside a request, `doc.toBytes(allocator)` returns the file.
 ```zig
 var ed = try pdf.Editor.load(allocator, uploaded_bytes); // bytes outlive the editor
 defer ed.deinit();
+// An encrypted file with a password: pdf.Editor.loadWith(allocator, bytes, .{ .password = pw })
+if (!ed.allows(.modify)) return error.Forbidden; // the app decides whether to honor it
 
 try ed.rotatePage(0, 90);
 try ed.removePage(ed.pageCount() - 1);
@@ -151,11 +157,15 @@ settings: mounting it with `server.mountModules` is optional.
   scripts need a shaper); text runs left to right.
 - PNG with 16 bits per channel and interlaced PNG are refused by name;
   images over 10,000 pixels on a side too.
-- Editing: encrypted (password-protected) files are refused with
-  `error.EncryptedPdf`; a save writes a new file, so a digital signature
-  the file had no longer validates; filled text fields are drawn by the
-  reader (`NeedAppearances`, honored by Acrobat, browsers and Preview), not
-  by this module; form fields of imported pages are not merged into the
+- Editing: an encrypted file that needs a password fails with
+  `error.EncryptedPdf` (`error.WrongPassword` for a wrong one); passwords
+  are not SASLprep-normalized (a revision 6 password with characters that
+  Unicode normalization changes may not open); public-key encryption is
+  refused; a save writes a new file, so a digital signature
+  the file had no longer validates; a filled text field's appearance is drawn
+  with WinAnsi characters only (others become `?`; the form also asks
+  readers to redraw, which Acrobat, browsers and Preview do); comb fields
+  are drawn as plain text; form fields of imported pages are not merged into the
   form of the target; stamps go in the page's unrotated space.
 - It does not render PDFs or extract their text.
 
