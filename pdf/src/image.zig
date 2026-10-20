@@ -7,9 +7,11 @@
 //! A PNG with transparency keeps it: the alpha channel becomes a soft mask,
 //! so a logo with a transparent background sits on whatever is under it.
 //!
-//! Refused with a named error instead of drawing garbage: interlaced PNGs
-//! and PNGs with 16 bits per channel (no logo exporter writes those by
-//! default), and images larger than `max_side` pixels on a side, which an
+//! Every bit depth PNG allows is read: 1, 2 and 4 bits (gray and palette
+//! images, which optimizers write for logos with few colors) and 16 bits
+//! (kept to 8, all a PDF page needs). Refused with a named error instead of
+//! drawing garbage: interlaced PNGs, and images larger than `max_side`
+//! pixels on a side, which an
 //! uploaded file could claim in its header to make the decoder allocate
 //! gigabytes before finding out the data is not there.
 
@@ -135,12 +137,21 @@ const ColorType = enum(u8) {
     gray_alpha = 4,
     rgba = 6,
 
-    fn bytesPerPixel(self: ColorType) usize {
+    fn samplesPerPixel(self: ColorType) usize {
         return switch (self) {
             .gray, .palette => 1,
             .gray_alpha => 2,
             .rgb => 3,
             .rgba => 4,
+        };
+    }
+
+    /// The bit depths the PNG specification allows for this color type.
+    fn allowsDepth(self: ColorType, depth: u8) bool {
+        return switch (self) {
+            .gray => depth == 1 or depth == 2 or depth == 4 or depth == 8 or depth == 16,
+            .palette => depth == 1 or depth == 2 or depth == 4 or depth == 8,
+            .gray_alpha, .rgb, .rgba => depth == 8 or depth == 16,
         };
     }
 };
@@ -179,6 +190,7 @@ pub fn decodePng(allocator: std.mem.Allocator, bytes: []const u8) !Decoded {
     var width: u32 = 0;
     var height: u32 = 0;
     var color_type: ColorType = .rgb;
+    var depth: u8 = 8;
     var palette: []const u8 = &.{};
     var trns: []const u8 = &.{};
     var compressed: std.ArrayList(u8) = .empty;
@@ -198,8 +210,9 @@ pub fn decodePng(allocator: std.mem.Allocator, bytes: []const u8) !Decoded {
             height = std.mem.readInt(u32, data[4..8], .big);
             if (width == 0 or height == 0) return Error.InvalidImage;
             if (width > max_side or height > max_side) return Error.ImageTooLarge;
-            if (data[8] != 8) return Error.PngBitDepthNotSupported;
             color_type = std.enums.fromInt(ColorType, data[9]) orelse return Error.PngColorTypeNotSupported;
+            depth = data[8];
+            if (!color_type.allowsDepth(depth)) return Error.PngBitDepthNotSupported;
             if (data[12] != 0) return Error.InterlacedPngNotSupported;
         } else if (std.mem.eql(u8, name, "PLTE")) {
             palette = data;
@@ -217,8 +230,12 @@ pub fn decodePng(allocator: std.mem.Allocator, bytes: []const u8) !Decoded {
     if (width == 0 or compressed.items.len == 0) return Error.InvalidImage;
     if (color_type == .palette and palette.len < 3) return Error.InvalidImage;
 
-    const bpp = color_type.bytesPerPixel();
-    const row_len = @as(usize, width) * bpp;
+    const samples = color_type.samplesPerPixel();
+    const bits_per_pixel = samples * depth;
+    // The filters work on whole bytes: the byte "to the left" is one pixel
+    // back, or one byte back when pixels are smaller than a byte.
+    const bpp = @max(1, bits_per_pixel / 8);
+    const row_len = (@as(usize, width) * bits_per_pixel + 7) / 8;
     const raw_len = (row_len + 1) * height;
 
     const raw = try zlibDecompress(allocator, compressed.items, raw_len);
@@ -247,23 +264,37 @@ pub fn decodePng(allocator: std.mem.Allocator, bytes: []const u8) !Decoded {
         const row = raw[base + 1 .. base + 1 + row_len];
         try unfilter(raw[base], row, previous, bpp);
         for (0..width) |x| {
-            const p = x * bpp;
             const n = y * width + x;
             const o = n * channels;
+            const first = x * samples;
             var a: u8 = 255;
             switch (color_type) {
-                .gray => pixels[o] = row[p],
-                .gray_alpha => {
-                    pixels[o] = row[p];
-                    a = row[p + 1];
+                .gray => {
+                    const v = sample(row, first, depth);
+                    pixels[o] = to8(v, depth);
+                    // tRNS of a gray image: the one gray value that is
+                    // transparent, as a 2-byte sample.
+                    if (trns.len >= 2 and v == std.mem.readInt(u16, trns[0..2], .big)) a = 0;
                 },
-                .rgb => @memcpy(pixels[o .. o + 3], row[p .. p + 3]),
-                .rgba => {
-                    @memcpy(pixels[o .. o + 3], row[p .. p + 3]);
-                    a = row[p + 3];
+                .gray_alpha => {
+                    pixels[o] = to8(sample(row, first, depth), depth);
+                    a = to8(sample(row, first + 1, depth), depth);
+                },
+                .rgb, .rgba => {
+                    var key = true;
+                    for (0..3) |c| {
+                        const v = sample(row, first + c, depth);
+                        pixels[o + c] = to8(v, depth);
+                        if (trns.len < 6 or v != std.mem.readInt(u16, trns[c * 2 ..][0..2], .big)) key = false;
+                    }
+                    if (color_type == .rgba) {
+                        a = to8(sample(row, first + 3, depth), depth);
+                    } else if (key) {
+                        a = 0;
+                    }
                 },
                 .palette => {
-                    const idx = @as(usize, row[p]);
+                    const idx: usize = sample(row, first, depth);
                     if (idx * 3 + 2 >= palette.len) return Error.InvalidImage;
                     @memcpy(pixels[o .. o + 3], palette[idx * 3 .. idx * 3 + 3]);
                     if (idx < trns.len) a = trns[idx];
@@ -280,6 +311,32 @@ pub fn decodePng(allocator: std.mem.Allocator, bytes: []const u8) !Decoded {
         return .{ .width = width, .height = height, .color_space = out_space, .pixels = pixels, .alpha = null };
     }
     return .{ .width = width, .height = height, .color_space = out_space, .pixels = pixels, .alpha = alpha };
+}
+
+/// The `index`-th sample of an unfiltered row, as stored: `depth` bits,
+/// packed from the high bit down when smaller than a byte, big-endian when
+/// 16 bits.
+fn sample(row: []const u8, index: usize, depth: u8) u16 {
+    return switch (depth) {
+        8 => row[index],
+        16 => std.mem.readInt(u16, row[index * 2 ..][0..2], .big),
+        else => blk: {
+            const bit = index * depth;
+            const shift: u3 = @intCast(8 - depth - bit % 8);
+            const mask: u8 = @intCast((@as(u16, 1) << @intCast(depth)) - 1);
+            break :blk (row[bit / 8] >> shift) & mask;
+        },
+    };
+}
+
+/// A sample of `depth` bits scaled to 8: 16 bits keep their high byte, and
+/// 1, 2 or 4 bits are spread over 0..255 (a 1-bit 1 is white, not 1).
+fn to8(v: u16, depth: u8) u8 {
+    return switch (depth) {
+        8 => @intCast(v),
+        16 => @intCast(v >> 8),
+        else => @intCast(v * 255 / ((@as(u16, 1) << @intCast(depth)) - 1)),
+    };
 }
 
 /// Undoes one row's PNG filter. Skipping it, or getting the order wrong,
@@ -348,6 +405,10 @@ const t = std.testing;
 
 /// Builds a real PNG: `rows` are the filtered rows (filter byte first).
 fn testPng(allocator: std.mem.Allocator, width: u32, height: u32, color_type: u8, rows: []const u8, extra: []const [2][]const u8) ![]u8 {
+    return testPngDepth(allocator, width, height, color_type, 8, rows, extra);
+}
+
+fn testPngDepth(allocator: std.mem.Allocator, width: u32, height: u32, color_type: u8, depth: u8, rows: []const u8, extra: []const [2][]const u8) ![]u8 {
     const comp = try zlibCompress(allocator, rows);
     defer allocator.free(comp);
     var out: std.ArrayList(u8) = .empty;
@@ -355,7 +416,7 @@ fn testPng(allocator: std.mem.Allocator, width: u32, height: u32, color_type: u8
     var ihdr: [13]u8 = undefined;
     std.mem.writeInt(u32, ihdr[0..4], width, .big);
     std.mem.writeInt(u32, ihdr[4..8], height, .big);
-    ihdr[8] = 8;
+    ihdr[8] = depth;
     ihdr[9] = color_type;
     ihdr[10] = 0;
     ihdr[11] = 0;
@@ -448,13 +509,68 @@ test "each PNG row filter is undone" {
     }
 }
 
+test "a 4-bit palette PNG unpacks two pixels per byte" {
+    // Three pixels, indices 0, 1, 2: 0x01 then 0x2_ (the last 4 bits pad).
+    const plte = &[_]u8{ 255, 0, 0, 0, 255, 0, 0, 0, 255 };
+    const png = try testPngDepth(t.allocator, 3, 1, 3, 4, &.{ 0, 0x01, 0x20 }, &.{.{ "PLTE", plte }});
+    defer t.allocator.free(png);
+    const img = try decodePng(t.allocator, png);
+    defer t.allocator.free(img.pixels);
+    try t.expectEqualSlices(u8, &.{ 255, 0, 0, 0, 255, 0, 0, 0, 255 }, img.pixels);
+}
+
+test "1- and 2-bit gray PNGs spread their values over 0..255" {
+    // 1 bit, ten pixels over two bytes; the second row is filtered (sub),
+    // which works byte by byte when pixels are smaller than a byte.
+    const rows = [_]u8{ 0, 0b1010_0000, 0b0100_0000, 1, 0b1010_0000, @as(u8, 0b0100_0000) -% 0b1010_0000 };
+    const png = try testPngDepth(t.allocator, 10, 2, 0, 1, &rows, &.{});
+    defer t.allocator.free(png);
+    const img = try decodePng(t.allocator, png);
+    defer t.allocator.free(img.pixels);
+    const row: []const u8 = &.{ 255, 0, 255, 0, 0, 0, 0, 0, 0, 255 };
+    try t.expectEqualSlices(u8, row, img.pixels[0..10]);
+    try t.expectEqualSlices(u8, row, img.pixels[10..20]);
+
+    const png2 = try testPngDepth(t.allocator, 4, 1, 0, 2, &.{ 0, 0b00_01_10_11 }, &.{});
+    defer t.allocator.free(png2);
+    const img2 = try decodePng(t.allocator, png2);
+    defer t.allocator.free(img2.pixels);
+    try t.expectEqualSlices(u8, &.{ 0, 85, 170, 255 }, img2.pixels);
+}
+
+test "16-bit PNGs keep the high byte of each sample, alpha included" {
+    const png = try testPngDepth(t.allocator, 1, 1, 6, 16, &.{ 0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0x80, 0x01 }, &.{});
+    defer t.allocator.free(png);
+    const img = try decodePng(t.allocator, png);
+    defer t.allocator.free(img.pixels);
+    defer t.allocator.free(img.alpha.?);
+    try t.expectEqualSlices(u8, &.{ 0x12, 0x56, 0x9a }, img.pixels);
+    try t.expectEqualSlices(u8, &.{0x80}, img.alpha.?);
+}
+
+test "tRNS of a gray or RGB PNG makes its one color transparent" {
+    const gray = try testPng(t.allocator, 2, 1, 0, &.{ 0, 7, 9 }, &.{.{ "tRNS", &.{ 0, 9 } }});
+    defer t.allocator.free(gray);
+    const g = try decodePng(t.allocator, gray);
+    defer t.allocator.free(g.pixels);
+    defer t.allocator.free(g.alpha.?);
+    try t.expectEqualSlices(u8, &.{ 255, 0 }, g.alpha.?);
+
+    const rgb = try testPng(t.allocator, 2, 1, 2, &.{ 0, 1, 2, 3, 1, 2, 4 }, &.{.{ "tRNS", &.{ 0, 1, 0, 2, 0, 3 } }});
+    defer t.allocator.free(rgb);
+    const c = try decodePng(t.allocator, rgb);
+    defer t.allocator.free(c.pixels);
+    defer t.allocator.free(c.alpha.?);
+    try t.expectEqualSlices(u8, &.{ 0, 255 }, c.alpha.?);
+}
+
 test "PNGs this decoder does not handle are refused by name" {
     var png = try testPng(t.allocator, 2, 2, 2, &.{ 0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6 }, &.{});
     defer t.allocator.free(png);
     png[8 + 8 + 12] = 1; // interlace
     try t.expectError(Error.InterlacedPngNotSupported, decodePng(t.allocator, png));
     png[8 + 8 + 12] = 0;
-    png[8 + 8 + 8] = 16; // bit depth
+    png[8 + 8 + 8] = 4; // bit depth PNG does not allow for RGB
     try t.expectError(Error.PngBitDepthNotSupported, decodePng(t.allocator, png));
     png[8 + 8 + 8] = 8;
     std.mem.writeInt(u32, png[16..20], 100_000, .big); // width

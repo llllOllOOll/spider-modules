@@ -30,8 +30,8 @@ LibreOffice) and no dependency beyond `std`.
 - **Opacity** on text, shapes, lines and images, and **rotation** of text
   and images: a diagonal translucent watermark is
   `.{ .size = 110, .opacity = 0.08, .rotate = 35, .@"align" = .center }`.
-- **Images**: PNG (gray, RGB, palette, with transparency kept as a soft
-  mask) and JPEG (embedded as it is). The same image drawn many times is
+- **Images**: PNG (gray, RGB, palette, every bit depth from 1 to 16, with
+  transparency kept as a soft mask) and JPEG (embedded as it is). The same image drawn many times is
   stored once.
 - **Links**, **document properties** (title, author... with accents),
   **page sizes** (A4, A5, Letter, Legal, custom, landscape, mixed in one
@@ -201,8 +201,8 @@ settings: mounting it with `server.mountModules` is optional.
   collections); kerning yes, but no ligatures or complex shaping (Arabic,
   Indic scripts need a shaper); text runs left to right. The standard
   fonts are not kerned.
-- PNG with 16 bits per channel and interlaced PNG are refused by name;
-  images over 10,000 pixels on a side too.
+- Interlaced PNG is refused by name; images over 10,000 pixels on a side
+  too.
 - Editing: an encrypted file that needs a password fails with
   `error.EncryptedPdf` (`error.WrongPassword` for a wrong one); passwords
   are not SASLprep-normalized (a revision 6 password with characters that
