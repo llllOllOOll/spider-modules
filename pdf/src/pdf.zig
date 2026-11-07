@@ -84,7 +84,7 @@ pub const Permission = editor.Permission;
 pub const spider_module = spider.module(.{
     .name = "pdf",
     .version = "0.1.0",
-    .spider = ">=0.11.0 <0.12.0",
+    .spider = ">=0.11.0 <0.13.0",
 });
 
 pub const SendOptions = struct {

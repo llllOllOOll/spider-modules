@@ -49,7 +49,7 @@ const worker = @import("worker.zig");
 pub const spider_module = spider.module(.{
     .name = "notify",
     .version = "0.2.0",
-    .spider = ">=0.11.0-dev.1 <0.12.0",
+    .spider = ">=0.11.0-dev.1 <0.13.0",
     .migrations = .{
         .{ .name = "0001_init", .sql = @embedFile("sql/0001_init.sql") },
     },

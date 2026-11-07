@@ -15,8 +15,8 @@ packages that plug into a Spider app through the module contract
 
 | Module | What it does | Spider |
 |---|---|---|
-| [`notify`](notify/) | Multi-channel notifications: transactional outbox, inbox, SSE, Web Push, FCM, email, retries and deduplication | `>=0.11.0-dev.1 <0.12.0` |
-| [`pdf`](pdf/) | PDF documents: write (fonts with subsetting and kerning, tables, paths, gradients, images, forms, bookmarks) and edit existing ones (merge, split, stamp, fill forms, encrypted files); std only | `>=0.11.0 <0.12.0` |
+| [`notify`](notify/) | Multi-channel notifications: transactional outbox, inbox, SSE, Web Push, FCM, email, retries and deduplication | `>=0.11.0-dev.1 <0.13.0` |
+| [`pdf`](pdf/) | PDF documents: write (fonts with subsetting and kerning, tables, paths, gradients, images, forms, bookmarks) and edit existing ones (merge, split, stamp, fill forms, encrypted files); std only | `>=0.11.0 <0.13.0` |
 
 ## Using a module
 
