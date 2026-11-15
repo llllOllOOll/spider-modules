@@ -8,19 +8,15 @@ retries, deduplication and a delivery log.
 It is a Spider module (RFC 0001): its own package in `spider-modules`
 (`notify/`, its own `build.zig`, imports only `std` and `spider`), with a
 manifest (`spider_module`), its migrations and a `check`. It was first
-written inside the Orbitx app, which is where the module contract was
+written inside an application, which is where the module contract was
 proven.
 
-## Prior art
+## Principles
 
-The shape follows what established frameworks do:
-
-- **Laravel Notifications** (`Illuminate\Notifications`): a notification is
-  one object; `via()` names its channels; each channel formats and sends;
-  each (recipient, channel) pair is a queued job; the `database` channel is
-  the in-app inbox and `broadcast` the real-time push.
-- **Noticed** (Rails): the same split, with delivery methods for FCM, APNs,
-  email, SMS and ActionCable bundled in the library.
+- **One notification, many channels**: a notification is one object that
+  names its channels; each channel formats and sends; each (recipient,
+  channel) pair is delivered on its own; the inbox channel is the in-app
+  list and SSE the real-time push.
 - **Transactional outbox**: the notification is written in the same
   transaction as the change that caused it, and a worker delivers it after
   commit. Rows are claimed with `FOR UPDATE SKIP LOCKED`.
@@ -129,8 +125,9 @@ id, attempt number, recipient, and the notification content.
 | `email` | queued | `spider.mail.Mailer` | address book, `email` |
 
 WhatsApp is not built in for now: the providers (Meta Cloud API, WAHA) need
-sender-number management that Orbitx already has, so Orbitx registers a
-`whatsapp` channel of its own that hands the message to its existing queue.
+sender-number management that an app may already have, so such an app
+registers a `whatsapp` channel of its own that hands the message to its
+existing queue.
 It is the first proof that app channels plug in like built-in ones.
 
 ## Running the worker
@@ -172,7 +169,7 @@ stores it in a module global, the way `spider.pg` keeps its pool.
 ## Gaps in Spider this module works around (proposals for Spider)
 
 1. Jobs get only the hub, boot hooks get no hub: the worker builds its own
-   `Io` per tick, like other Orbitx jobs.
+   `Io` per tick, like other app jobs.
 2. `spider.pg` does not wrap `LISTEN/NOTIFY`: the worker polls (1 s).
 3. ~~A module cannot ship migrations~~: solved by Spider 0.11 modules
    (`spider_module.migrations`, RFC 0001).

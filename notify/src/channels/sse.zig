@@ -12,8 +12,8 @@ pub const Options = struct {
     /// The SSE event name the pages listen for.
     event: []const u8 = "notification",
     /// The hub channel of a user. Null: `"user:<user id>"`. An app whose
-    /// pages join another name (Orbitx joins `"user:<Keycloak sub>"`, while
-    /// its notification recipients are database ids) maps it here; an error
+    /// pages join another name (e.g. `"user:<Keycloak sub>"`, while its
+    /// notification recipients are database ids) maps it here; an error
     /// counts as a transient failure.
     hub_channel: ?*const fn (arena: std.mem.Allocator, user_id: []const u8) anyerror![]const u8 = null,
     /// Send the content (kind, title, body, url, icon) with the event.

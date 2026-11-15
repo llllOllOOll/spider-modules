@@ -19,7 +19,7 @@ pub fn main(init: std.process.Init) !void {
 
     var doc = try pdf.Document.init(allocator, .{ .info = .{
         .title = "Invoice 2026-0042",
-        .author = "Zivyar Telecom",
+        .author = "Example Telecom",
         .subject = "Monthly services — October",
         .creator = "spider_pdf sample",
     } });
