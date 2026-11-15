@@ -15,7 +15,9 @@ modules consistent and reviewable.
   does the same for the tests.
 - The package name is `spider_<name>`; the module name in the manifest is
   `<name>`.
-- 100% English: code, comments, messages, documentation, commits.
+- 100% English: code, comments, messages, documentation, commits. Only
+  Spider and its modules: no other frameworks, products or comparisons
+  (see `AGENTS.md`).
 
 ## The manifest
 
